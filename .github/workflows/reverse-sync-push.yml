@@ -1,0 +1,26 @@
+name: Reverse Sync on Push
+
+on:
+  push:
+    branches:
+      - main
+      - release-*
+
+permissions:
+  contents: read
+  pull-requests: write
+
+concurrency:
+  group: reverse-sync-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  reverse-sync:
+    uses: alaudadevops/run-actions/.github/workflows/reverse-sync-push.yml@main
+    with:
+      target_repo: alaudadevops/artifacthub-shim
+      ignore_paths: .github/,README.md,.gitignore
+      synced_paths: >-
+        docs/,.yarn/,.yarnrc.yml,.env.yarn,doom.config.yml,yarn.lock,tsconfig.json,package.json,sites.yaml,theme/,global.d.ts,cspell.config.mjs,eslint.config.mjs
+    secrets:
+      GH_TOKEN: ${{ secrets.GH_TOKEN }}

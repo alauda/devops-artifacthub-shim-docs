@@ -1,0 +1,12 @@
+.DS_Store
+.devspace/
+node_modules/
+dist/
+docs/public/_remotes/
+
+.yarn/*
+!.yarn/patches
+!.yarn/plugins
+!.yarn/releases
+!.yarn/sdks
+!.yarn/versions
