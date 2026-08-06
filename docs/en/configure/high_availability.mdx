@@ -1,0 +1,256 @@
+---
+weight: 20
+category: feature
+---
+
+# High Availability
+
+`artifacthub-shim` can run multiple API replicas behind one Kubernetes Service.
+Use this mode to improve read availability and spread resolver/UI traffic across
+pods.
+
+## What HA means
+
+Each replica is an independent read server:
+
+- It watches the same repository configuration.
+- It refreshes catalog sources into its own source work directory.
+- It builds and publishes its own immutable read snapshot.
+- It serves requests only after its first snapshot is ready.
+
+This model provides read redundancy and read traffic distribution. It does not
+provide leader election, a shared runtime metadata index, or a single coordinated
+source refresher. Repository changes can become visible on different replicas at
+slightly different times while each pod completes its own refresh cycle.
+
+## Baseline HA values
+
+Use this profile for normal offline catalog deployments and small to medium
+custom catalog sets:
+
+```yaml
+replicaCount: 3
+
+config:
+  refreshInterval: 30m
+  initialSyncTimeout: 5m
+  repositoryEventDebounce: 5s
+  maxConcurrentSources: 2
+  enableConfigMapSources: true
+  uiRBACCacheTTL: 60s
+  kubeClientQPS: 50
+  kubeClientBurst: 100
+
+storage:
+  contentStore:
+    enabled: false
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+
+service:
+  type: ClusterIP
+```
+
+The baseline keeps the HA deployment simple:
+
+- Three replicas provide redundancy for in-cluster clients.
+- A longer refresh interval reduces repeated Git and indexing load across pods.
+- `maxConcurrentSources: 2` limits each pod to two concurrent source loads.
+- UI RBAC cache and Kubernetes client limits reduce repeated TokenReview and
+  SubjectAccessReview pressure from UI traffic.
+- ContentStore stays disabled so no shared runtime storage is required.
+- The resource baseline leaves room for refresh-time memory overlap in typical
+  offline catalog deployments.
+- `ClusterIP` keeps traffic internal for Tekton resolver and DevOps UI paths.
+
+## Sizing and load model
+
+`config.maxConcurrentSources` is a per-pod limit. In HA mode, cluster-wide
+source refresh concurrency is approximately:
+
+```text
+replicaCount * config.maxConcurrentSources
+```
+
+For the baseline values, the cluster may load about `3 * 2 = 6` sources at the
+same time during a refresh cycle. Increase this value only when refresh latency
+is a real problem and the Git server, API server, CPU, memory, and disk I/O
+budget can absorb the additional load.
+
+For ConfigMap-backed Git sources, a source means one nested
+`gitRepositories[].repositories[]` entry in `repository.yaml`, not one ConfigMap
+object. A single ConfigMap can declare multiple externally visible repositories,
+and each entry is loaded and indexed as an independent source during refresh.
+When estimating HA load, count the total number of repository entries across all
+labeled ConfigMaps.
+
+Keep resource requests realistic. The baseline `512Mi` memory request and `1Gi`
+memory limit are a starting point, not a capacity guarantee. Each replica builds
+its own snapshot and, when ContentStore is disabled, keeps manifest and README
+payloads in memory. Refreshes can temporarily hold the current serving snapshot
+and the next snapshot at the same time.
+
+For many ConfigMap-backed Git sources, large README payloads, or large catalog
+sets with ContentStore disabled, use a larger profile:
+
+```yaml
+resources:
+  requests:
+    cpu: 500m
+    memory: 1Gi
+  limits:
+    cpu: "2"
+    memory: 2Gi
+```
+
+## Repository ConfigMaps in HA
+
+Use multi-repository ConfigMaps for entries that are operationally owned
+together, such as `task`, `pipeline`, and `stepaction` paths from the same
+Git repository and team.
+
+Avoid putting unrelated teams or high-risk repositories into one ConfigMap. If
+any `gitRepositories[]` item or nested `repositories[]` item in a ConfigMap is
+invalid, `artifacthub-shim` rejects the whole ConfigMap payload. Splitting
+independent repositories into separate ConfigMaps limits the blast radius of a
+bad URL, invalid path, duplicate name, or credential reference.
+
+## Choose a storage mode
+
+`sourceWorkDir` stores materialized source checkouts and provider caches. It can
+be made persistent to reduce pod-recreation cost for large external repository
+sources, but it does not store a ready-to-serve metadata index. Each pod still
+fetches or validates the requested revision, scans source files, and rebuilds its
+own snapshot before becoming ready. In HA mode, `sourceWorkDir` must stay
+pod-local because Git checkouts are mutable runtime state.
+
+| Mode | Use when | HA behavior |
+| --- | --- | --- |
+| `storage.sourceWorkDir.type=emptyDir` | Default HA deployment. Source reload cost is acceptable. | Each pod has an independent local workdir. Pod restart starts from an empty workdir. |
+| `type=pvc` | Single-replica deployment needs a persistent source workdir. | Not supported for HA. The chart rejects this mode with multiple replicas. |
+| `type=existingPVC` | Single-replica deployment provides a pre-created persistent source workdir. | Not supported for HA. The chart rejects this mode with multiple replicas. |
+
+ContentStore stores manifest and README payload bytes; it does not store the
+metadata index or coordinate replicas. Each pod still builds and keeps its own
+metadata index, package maps, search tokens, source status, and hot payload
+cache.
+
+| Mode | Use when | HA behavior |
+| --- | --- | --- |
+| `storage.contentStore.enabled=false` | Default HA deployment. Catalog payloads fit in memory. | Each pod keeps payload bytes in its own in-memory snapshot and can rebuild from sources after restart. |
+| `type=emptyDir` | Payload bytes create measured memory pressure, and pod-local storage is acceptable. | Each pod has independent local content storage. Pod restart loses that local payload cache, then rebuilds it on refresh. |
+| `type=pvc` | Single-replica deployment that needs a chart-created PVC. | Not supported for HA. The chart rejects this mode with multiple replicas. |
+| `type=existingPVC` | Single-replica deployment provides a pre-created content store PVC. | Not supported for HA. The chart rejects this mode with multiple replicas. |
+
+Enable ContentStore only when all of these are true:
+
+- There are many configured repositories or very large manifest/README payloads.
+- Pod memory pressure is visible and attributable to payload storage.
+- The operational cost of additional storage configuration is acceptable.
+
+If ContentStore must be enabled with multiple replicas, prefer pod-local
+`emptyDir`:
+
+```yaml
+replicaCount: 3
+
+storage:
+  contentStore:
+    enabled: true
+    type: emptyDir
+    emptyDir:
+      sizeLimit: 5Gi
+```
+
+Avoid PVC-backed runtime storage in HA mode. The chart rejects
+`replicaCount>1` when ContentStore uses `pvc` or `existingPVC`. Keep
+`replicaCount: 1` for those storage modes:
+
+```yaml
+replicaCount: 1
+
+storage:
+  contentStore:
+    enabled: true
+    type: pvc
+    pvc:
+      accessModes:
+        - ReadWriteOnce
+```
+
+For `existingPVC`, set a soft limit because the chart cannot infer the claim
+capacity:
+
+```yaml
+replicaCount: 1
+
+storage:
+  contentStore:
+    enabled: true
+    type: existingPVC
+    maxBytes: 20Gi
+    pvc:
+      existingClaim: artifacthub-shim-content
+```
+
+## Operational checklist
+
+UI-compatible endpoints use the shared request authentication chain. In HA mode,
+the authorization cache is per pod, so repeated requests that land on different
+replicas may still perform separate platform, OIDC, or Kubernetes reviews.
+
+Use this checklist when enabling or validating HA:
+
+- Confirm every replica reaches `/readyz` before treating the Service as ready
+  for resolver or UI traffic.
+- Load test through the Kubernetes Service, not by connecting to a single pod.
+- Watch Git server load, Kubernetes API throttling, CPU, memory, and disk I/O
+  during initial sync and background refresh.
+- Keep `config.uiRBACCacheTTL` enabled for normal UI traffic. Increase
+  `config.kubeClientQPS` and `config.kubeClientBurst` only when metrics or logs
+  show client-side throttling during UI list/detail requests.
+- Add scheduling rules that spread replicas across nodes or zones according to
+  the cluster policy.
+
+For example, spread replicas across nodes with pod anti-affinity:
+
+```yaml
+affinity:
+  podAntiAffinity:
+    preferredDuringSchedulingIgnoredDuringExecution:
+      - weight: 100
+        podAffinityTerm:
+          labelSelector:
+            matchLabels:
+              app.kubernetes.io/name: artifacthub-shim
+          topologyKey: kubernetes.io/hostname
+```
+
+## Probes and initial sync
+
+The API server starts before the initial source refresh completes. `/healthz`
+reports process liveness, while `/readyz` returns success only after the first
+snapshot has been published. This lets Kubernetes keep the process alive during
+large initial syncs while keeping the Service endpoint unready. Source-level
+failures in the first refresh are published as source statuses in the snapshot
+instead of keeping the pod unready indefinitely.
+
+The chart also exposes configurable `startupProbe`, `livenessProbe`, and
+`readinessProbe` values. The default `startupProbe` is disabled because the
+server listens before the initial refresh. Enable it when your environment has
+slow image startup, slow catalog init containers, or storage paths that can
+delay the process before it starts listening:
+
+```yaml
+probes:
+  startup:
+    enabled: true
+    failureThreshold: 30
+    periodSeconds: 10
+```

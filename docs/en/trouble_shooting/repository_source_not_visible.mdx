@@ -1,0 +1,215 @@
+---
+weight: 10
+category: troubleshooting
+---
+
+# Repository Source Is Not Visible
+
+## Problem Description
+
+After creating a repository ConfigMap for `artifacthub-shim`, the expected
+`Task`, `Pipeline`, or `StepAction` does not appear in the shim API, DevOps Hub
+UI, or Tekton hub resolver results.
+
+### Error Manifestation
+
+Common symptoms include:
+
+- The package detail API returns `404`.
+- The package is missing from `/api/v1/packages/search`.
+- The UI list does not show the resource.
+- The repository ConfigMap has `RepositorySourceInvalid` or
+  `RepositorySourceDegraded` Events.
+- The `TaskRun` or `PipelineRun` using `resolver: hub` cannot resolve the
+  referenced resource.
+
+## Root Cause Analysis
+
+The usual causes are:
+
+1. The ConfigMap is not watched by `artifacthub-shim`.
+2. `repository.yaml` is missing or invalid.
+3. Another source uses the same repository name.
+4. The referenced Secret is missing or contains unsupported credential keys.
+5. Git clone or fetch fails.
+6. The catalog directory layout is invalid.
+7. The package or version is disabled.
+
+`artifacthub-shim` isolates source failures across ConfigMaps. If one entry in
+a ConfigMap is invalid, all repository entries in that ConfigMap are rejected,
+but repositories declared by other ConfigMaps remain isolated. For transient Git
+failures, the previous last-good source shard may continue to be served if one
+exists.
+
+## Troubleshooting
+
+:::tip
+The commands below assume that `artifacthub-shim` is installed into the
+`artifacthub-shim-system` namespace. Replace the namespace if your installation
+uses a different value.
+:::
+
+### 1. Check shim readiness
+
+```bash
+kubectl get deployment artifacthub-shim -n artifacthub-shim-system
+```
+
+If the Deployment is unavailable or restarting, check the pod logs before
+investigating a single repository.
+
+### 2. Check the repository ConfigMap label and data key
+
+The ConfigMap must have the repository label and `repository.yaml` data key.
+
+```bash
+kubectl get configmap <configmap-name> \
+  -n artifacthub-shim-system \
+  -o yaml
+```
+
+Required shape:
+
+```yaml
+metadata:
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-a/tekton-catalog.git
+        revision: main
+        repositories:
+          - name: team-a-tasks
+            kind: task
+            path: task
+```
+
+If the label is missing or has a value other than `"true"`, the ConfigMap is
+ignored.
+
+### 3. Inspect repository ConfigMap Events
+
+Check recent Events on the repository ConfigMap:
+
+```bash
+kubectl describe configmap <configmap-name> \
+  -n artifacthub-shim-system
+```
+
+You can also list Events directly:
+
+```bash
+kubectl get events -n artifacthub-shim-system \
+  --field-selector involvedObject.kind=ConfigMap,involvedObject.name=<configmap-name>
+```
+
+For persistent Warning states, `artifacthub-shim` records the Warning again on
+each refresh or resource sync attempt. Kubernetes usually keeps this as one
+Event with an increasing count and updated last timestamp. If event TTL cleanup
+removes the previous Event, the next attempt can create it again.
+
+Events are still historical. A previous `RepositoryConfigInvalid` or
+`RepositorySourceInvalid` entry can remain visible until Kubernetes event TTL
+cleanup, even after the configuration has been fixed. Use the latest
+`RepositoryConfigAccepted` or `RepositorySourceReady` Event together with
+`/api/v1/snapshot` source statuses to determine the current state.
+
+Common Event reasons:
+
+| Event reason | Meaning |
+| --- | --- |
+| `RepositoryConfigAccepted` | `repository.yaml` was accepted. |
+| `RepositoryConfigInvalid` | `repository.yaml` is missing, cannot be parsed, or failed validation. |
+| `RepositorySourceReady` | A repository source was indexed and is visible. |
+| `RepositorySourceInvalid` | A repository source did not enter the current snapshot. |
+| `RepositorySourceDegraded` | A repository source failed this refresh but still serves its previous successful shard. |
+
+Common reason message patterns:
+
+| Reason pattern | Meaning |
+| --- | --- |
+| `missing repository.yaml` | The ConfigMap does not have the required data key. |
+| `gitRepositories is required` | `repository.yaml` does not contain any Git repository entries. |
+| `repositories or extraResources is required` | A `repository.yaml.gitRepositories[]` item contains neither catalog repositories nor extra resource directories. |
+| `name is required` | `repository.yaml.gitRepositories[].repositories[].name` is empty. |
+| `unsupported kind` | `kind` is not `task`, `pipeline`, or `stepaction`. |
+| `path must be relative` | `path` is absolute. |
+| `path must not escape repository root` | `path` uses `..` to leave the repository root. |
+| `duplicate repository name` | More than one source declares the same repository name. |
+| `secret ... not found` | `credentialRef.name` points to a missing Secret. |
+| `no Tekton manifest found` | The package version directory does not contain a valid manifest. |
+| `multiple Tekton manifest candidates` | The version directory has more than one fallback manifest candidate. |
+
+### 4. Validate repository name uniqueness
+
+Repository names are global catalog identifiers. Two repository entries cannot
+share the same `repository.yaml.gitRepositories[].repositories[].name`, even if
+they are in different ConfigMaps or point to different Git URLs.
+
+Find all repository ConfigMaps:
+
+```bash
+kubectl get configmap -n artifacthub-shim-system \
+  -l artifacthub-shim.alauda.io/repository=true \
+  -o yaml
+```
+
+If two entries use the same `name`, rename one of them and update any hub
+resolver references that use the old catalog name.
+
+### 5. Check Secret keys
+
+If a `repository.yaml.gitRepositories[]` entry uses `credentialRef`, verify the
+Secret exists in the same watched namespace:
+
+```bash
+kubectl get secret <secret-name> -n artifacthub-shim-system
+```
+
+Supported keys are:
+
+- `username`
+- `password`
+- `token`
+- `sshPrivateKey`
+- `ssh-privatekey`
+- `known_hosts`
+- `ca.crt`
+
+Do not place credentials in the ConfigMap.
+
+### 6. Check API pod logs
+
+```bash
+kubectl logs -n artifacthub-shim-system \
+  deployment/artifacthub-shim \
+  --tail=200
+```
+
+Look for Git clone errors, YAML parse errors, manifest identity errors, or
+content size limit errors.
+
+### 7. Check disabled package rules
+
+If the source is `Ready` but a specific package is missing, check
+`disabledPackages` in the repository ConfigMap and `config.disabledPackages` in
+the chart values.
+
+Repository-local example:
+
+```yaml
+disabledPackages:
+  - name: run-script
+    versions:
+      - "0.1"
+```
+
+A disabled package or version is intentionally removed from list, search,
+detail, and resolver responses.
+
+## Related Content
+
+- [Configure Custom Git Repositories](../how_to/configure_custom_git_repositories.mdx)
+- [Disable Catalog Packages](../how_to/disable_catalog_packages.mdx)
+- [Hub Resolver Cannot Resolve a Resource](hub_resolver_cannot_resolve_resource.mdx)

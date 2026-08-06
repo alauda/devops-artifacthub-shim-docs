@@ -1,0 +1,55 @@
+---
+weight: 30
+category: troubleshooting
+---
+
+# Historical Pipeline Catalog References
+
+## Problem Description
+
+Older `PipelineRun` definitions may use `resolver: hub` with
+`catalog: catalog` for Pipelines. The built-in Pipeline repository served by
+`artifacthub-shim` is `catalog-pipelines`, while `catalog` is the built-in Task
+repository.
+
+## Current Compatibility
+
+`artifacthub-shim` provides a compatibility fallback for Pipeline lookups:
+
+- `pipeline/catalog/<name>/<version>` falls back to
+  `pipeline/catalog-pipelines/<name>/<version>`.
+- Latest-version detail lookups without an explicit version also return the
+  resolved Pipeline manifest.
+- UI detail, UI batch, Artifact Hub detail, and legacy raw YAML paths share the
+  same fallback.
+
+Fallback usage is logged at warning level and counted by
+`artifacthub_shim_pipeline_catalog_fallback_total`.
+
+## Recommended Fix
+
+For new or edited Pipeline references, use the canonical Pipeline catalog:
+
+```yaml
+pipelineRef:
+  resolver: hub
+  params:
+    - name: type
+      value: artifact
+    - name: catalog
+      value: catalog-pipelines
+    - name: kind
+      value: pipeline
+    - name: name
+      value: java-image-build-scan-deploy
+    - name: version
+      value: "0.1"
+```
+
+If the resolver defaults are already set in `TektonConfig`, you can also omit
+the `catalog` parameter for Pipeline references and use the configured default.
+
+## Related Content
+
+- [Configure Tekton Integration](../how_to/configure_tekton_integration.mdx)
+- [Hub Resolver Cannot Resolve a Resource](hub_resolver_cannot_resolve_resource.mdx)

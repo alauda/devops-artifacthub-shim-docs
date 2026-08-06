@@ -1,0 +1,229 @@
+---
+weight: 20
+category: troubleshooting
+---
+
+# Hub Resolver Cannot Resolve a Resource
+
+## Problem Description
+
+A `TaskRun` or `PipelineRun` references a remote resource with
+`resolver: hub`, but Tekton cannot resolve the `Task`, `Pipeline`, or
+`StepAction` from `artifacthub-shim`.
+
+### Error Manifestation
+
+Common symptoms include:
+
+- The run stays in a resolution failure state.
+- No workload Pod is created.
+- The run status or resolver logs mention a missing package or version.
+- The resolver still tries to use the default upstream Artifact Hub endpoint.
+
+Example hub reference:
+
+```yaml
+taskRef:
+  resolver: hub
+  params:
+    - name: type
+      value: artifact
+    - name: catalog
+      value: catalog
+    - name: kind
+      value: task
+    - name: name
+      value: run-script
+    - name: version
+      value: "0.1.0"
+```
+
+## Root Cause Analysis
+
+The usual causes are:
+
+1. Hub resolver is not enabled.
+2. `TektonConfig` does not set the hub resolver type to `artifact`.
+3. The reconciled `artifact-hub-api` does not point to `artifacthub-shim`.
+4. The resolver Pod has not picked up the updated ConfigMap.
+5. The `catalog`, `kind`, `name`, or `version` parameter does not match a shim
+   package.
+6. The target repository source is invalid, degraded without a last-good shard,
+   or disabled.
+
+## Troubleshooting
+
+:::tip
+The commands below derive the Tekton resolver namespace from
+`TektonConfig.spec.targetNamespace` and assume `artifacthub-shim` runs in
+`artifacthub-shim-system`. Replace the shim namespace if your installation uses
+a different value.
+:::
+
+### 1. Verify TektonConfig
+
+Check the hub resolver settings in `TektonConfig`:
+
+```bash
+kubectl get tektonconfig config -o yaml
+```
+
+The `spec.pipeline` section should include:
+
+```yaml
+spec:
+  pipeline:
+    enable-hub-resolver: true
+    hub-resolver-config:
+      artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+      default-artifact-hub-task-catalog: catalog
+      default-artifact-hub-pipeline-catalog: catalog-pipelines
+      default-kind: task
+      default-tekton-hub-catalog: catalog
+      default-type: artifact
+```
+
+If `default-type` is not `artifact`, add `type: artifact` to each hub
+reference or update the default.
+
+### 2. Verify the reconciled resolver ConfigMap
+
+The operator reconciles `TektonConfig.spec.pipeline.hub-resolver-config` into
+the `hubresolver-config` ConfigMap.
+
+```bash
+RESOLVER_NAMESPACE="$(kubectl get tektonconfig config \
+  -o jsonpath='{.spec.targetNamespace}')"
+
+kubectl get configmap hubresolver-config \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o yaml
+```
+
+Expected values:
+
+```yaml
+data:
+  artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+  default-tekton-hub-catalog: catalog
+  default-type: artifact
+```
+
+Also check the resolver feature flag:
+
+```bash
+kubectl get configmap resolvers-feature-flags \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o jsonpath='{.data.enable-hub-resolver}{"\n"}'
+```
+
+Expected output:
+
+```text
+true
+```
+
+### 3. Check resolver Pod environment
+
+Find the remote resolver Pod:
+
+```bash
+kubectl get pods -n "${RESOLVER_NAMESPACE}"
+```
+
+Check whether the resolver Deployment consumes `hubresolver-config`:
+
+```bash
+kubectl get deployment -n "${RESOLVER_NAMESPACE}" \
+  -o yaml | grep -A5 -B5 ARTIFACT_HUB_API
+```
+
+If the ConfigMap is correct but the resolver still uses old values, restart the
+resolver Pod so it reads the updated environment variables:
+
+```bash
+kubectl delete pod -n "${RESOLVER_NAMESPACE}" \
+  -l app.kubernetes.io/component=resolvers
+```
+
+If your installation uses different resolver labels, delete the specific
+remote resolver Pod returned by `kubectl get pods`.
+
+### 4. Verify shim Service and repository health
+
+Check that the shim Deployment and Service are available:
+
+```bash
+kubectl get deployment,service,endpoints \
+  -n artifacthub-shim-system \
+  -l app.kubernetes.io/name=artifacthub-shim
+```
+
+Then inspect the repository ConfigMap Events for the catalog used by the hub
+reference:
+
+```bash
+kubectl describe configmap <repository-configmap-name> \
+  -n artifacthub-shim-system
+```
+
+`RepositorySourceReady` means the catalog is visible to resolver clients.
+`RepositorySourceInvalid` or `RepositorySourceDegraded` means the resolver may
+fail even when the shim API pod itself is healthy.
+
+### 5. Verify the exact package requested by the resolver
+
+Compare the hub resolver params with the repository source and catalog content:
+
+- `catalog` must match `repository.yaml.gitRepositories[].repositories[].name`.
+- `kind` must match the repository source kind.
+- `name` must match the package directory name under the configured `path`.
+- `version` must match a version directory or a supported semver-compatible
+  selector.
+
+For built-in catalog resources, use `catalog` for Tasks and
+`catalog-pipelines` for Pipelines. Historical Pipeline references that still
+use `catalog` are supported by a shim fallback, but new references should use
+`catalog-pipelines`.
+
+If the source is Ready but the package is still missing, check disabled package
+rules in the repository ConfigMap and chart values.
+
+### 6. Check version formatting
+
+Quote numeric-looking versions in YAML:
+
+```yaml
+- name: version
+  value: "0.1.0"
+```
+
+`artifacthub-shim` supports normalized semver lookup. For example, a catalog
+directory named `0.1` can be returned as `0.1.0` for resolver compatibility.
+If the resolver uses a version constraint, verify that the catalog contains a
+matching non-prerelease version directory.
+
+### 7. Check resolver logs
+
+```bash
+kubectl logs -n "${RESOLVER_NAMESPACE}" \
+  deployment/tekton-pipelines-remote-resolvers \
+  --tail=200
+```
+
+If your resolver Deployment has a different name, use:
+
+```bash
+kubectl get deployment -n "${RESOLVER_NAMESPACE}"
+```
+
+Then query logs from the matching resolver Deployment or Pod.
+
+## Related Content
+
+- [Quick Start](../quick_start.mdx)
+- [Consume Resources with the Hub Resolver](../how_to/consume_resources_with_hub_resolver.mdx)
+- [Configure Tekton Integration](../how_to/configure_tekton_integration.mdx)
+- [Historical Pipeline Catalog References](historical_pipeline_catalog.mdx)
+- [Repository Source Is Not Visible](repository_source_not_visible.mdx)
+- [Tekton Hub Resolver](https://tekton.dev/docs/pipelines/hub-resolver/)

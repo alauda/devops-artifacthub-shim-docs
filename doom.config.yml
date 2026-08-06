@@ -1,0 +1,22 @@
+title: Alauda DevOps Artifact Hub Shim Docs
+logoText: Alauda DevOps Artifact Hub Shim Docs
+lang: en
+root: docs
+
+api:
+  crds:
+    - docs/shared/crds/**/*.{yaml,yml}
+  openapis:
+    - docs/shared/openapis/**/*.{json,yaml,yml}
+
+permission:
+  functionresources:
+    - docs/shared/functionresources/**/*.{yaml,yml}
+  roletemplates:
+    - docs/shared/roletemplates/**/*.{yaml,yml}
+
+internalRoutes:
+  - '*/development/**/*'
+  - '**/development/**/*'
+  - '*/design/**/*'
+  - '**/design/**/*'

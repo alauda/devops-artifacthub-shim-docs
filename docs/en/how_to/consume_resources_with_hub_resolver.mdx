@@ -1,0 +1,165 @@
+---
+weight: 40
+category: howto
+---
+
+# Consume Resources with the Hub Resolver
+
+## Feature Overview
+
+Tekton hub resolver can fetch remote `Task`, `Pipeline`, and `StepAction`
+manifests from `artifacthub-shim` when `TektonConfig` points the Artifact Hub
+endpoint to the shim API.
+
+The resolver `catalog` parameter must match a `repository.yaml`
+`gitRepositories[].repositories[].name` value for ConfigMap-backed repositories,
+or one of the built-in catalog names:
+
+| Built-in catalog | Kind |
+| --- | --- |
+| `catalog` | `task` |
+| `catalog-pipelines` | `pipeline` |
+| `catalog-stepactions` | `stepaction` |
+
+The built-in StepAction catalog is registered only when the packaged catalog
+contains a `stepaction/` directory.
+
+## Prerequisites
+
+- `artifacthub-shim` is installed and ready.
+- Tekton hub resolver is enabled.
+- `TektonConfig.spec.pipeline.hub-resolver-config.default-type` is set to
+  `artifact`, or each reference explicitly passes `type: artifact`.
+- `default-tekton-hub-catalog` remains set to `catalog`; current resolver
+  versions still read it even when Artifact Hub mode is the default.
+
+## Reference a Task
+
+Use a remote Task in `taskRef`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: run-remote-task
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: run-script
+      - name: version
+        value: "0.1.0"
+  params:
+    - name: script
+      value: echo docs-verify
+```
+
+## Reference a Pipeline
+
+Use a remote Pipeline in `pipelineRef`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: run-remote-pipeline
+spec:
+  pipelineRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: catalog-pipelines
+      - name: kind
+        value: pipeline
+      - name: name
+        value: build-deploy
+      - name: version
+        value: "0.2.0"
+```
+
+## Reference a StepAction
+
+Use a remote StepAction in a step `ref`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: run-remote-stepaction
+spec:
+  taskSpec:
+    steps:
+      - name: echo
+        ref:
+          resolver: hub
+          params:
+            - name: type
+              value: artifact
+            - name: catalog
+              value: catalog-stepactions
+            - name: kind
+              value: stepaction
+            - name: name
+              value: echo-message
+            - name: version
+              value: "0.1.0"
+```
+
+StepAction references should pass `catalog` explicitly. Current hub resolver
+defaults only include Artifact Hub task and pipeline catalog settings.
+
+## Historical Pipeline Catalog Compatibility
+
+Older Pipeline references may use `catalog: catalog`. New references should use
+`catalog-pipelines`, but shim keeps a lookup fallback from `pipeline/catalog` to
+`pipeline/catalog-pipelines` for compatibility. See
+[Historical Pipeline Catalog References](../trouble_shooting/historical_pipeline_catalog.mdx)
+for the exact behavior and recommended cleanup.
+
+## Parameter Reference
+
+| Parameter | Description | Example |
+| --- | --- | --- |
+| `type` | Hub backend type. Use `artifact` for `artifacthub-shim`. | `artifact` |
+| `catalog` | Artifact Hub repository name served by the shim. | `catalog` |
+| `kind` | Tekton resource kind. | `task` |
+| `name` | Resource package name. | `run-script` |
+| `version` | Resource version or supported version constraint. Quote numeric-looking values. | `"0.1.0"` |
+
+## Verification
+
+If a resource does not resolve, first check the `TaskRun` or `PipelineRun`
+status:
+
+```bash
+kubectl get taskrun run-remote-task -o yaml
+```
+
+Resolver failures usually appear before the workload Pod is created. If the
+failure mentions a missing catalog, package, or version, inspect the repository
+ConfigMap Events:
+
+```bash
+kubectl describe configmap <repository-configmap-name> \
+  -n artifacthub-shim-system
+```
+
+Look for `RepositorySourceReady`, `RepositorySourceInvalid`, or
+`RepositorySourceDegraded`. Use the resolver logs only after the run status and
+repository Events do not explain the failure.
+
+## Learn More
+
+- [Quick Start](../quick_start.mdx)
+- [Configure Tekton Integration](configure_tekton_integration.mdx)
+- [Troubleshoot hub resolver failures](../trouble_shooting/hub_resolver_cannot_resolve_resource.mdx)
+- [Tekton Hub Resolver](https://tekton.dev/docs/pipelines/hub-resolver/)

@@ -1,0 +1,123 @@
+---
+weight: 30
+category: howto
+---
+
+# Disable Catalog Packages
+
+## Feature Overview
+
+Use disabled package rules when a catalog contains resources that should not be
+visible to users or resolver clients. Rules can disable a whole package or only
+specific versions.
+
+There are two configuration entry points:
+
+| Source type | Configuration | Reload behavior |
+| --- | --- | --- |
+| ConfigMap-backed Git repository | `repository.yaml.gitRepositories[].repositories[].disabledPackages` | Hot reloaded after ConfigMap changes. |
+| Built-in or static filesystem catalog | Helm value `config.disabledPackages` | Requires the chart-managed pod configuration to roll out. |
+
+## Disable Packages in a ConfigMap Repository
+
+Add `disabledPackages` to the repository ConfigMap.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-team-a-tasks
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-a/tekton-catalog.git
+        revision: main
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+            path: task
+            disabledPackages:
+              - name: unsafe-task
+              - name: legacy-task
+                versions:
+                  - "0.1"
+                  - "0.2"
+```
+
+In this example:
+
+- `unsafe-task` is completely hidden.
+- Only versions `0.1` and `0.2` of `legacy-task` are hidden.
+- Other repositories and other package names are not affected.
+
+ConfigMap-backed rules are source-local. If another repository also contains
+`legacy-task`, it remains visible unless that repository has its own disable
+rule.
+
+## Disable Packages in the Built-in Catalog
+
+For the built-in catalog or static filesystem sources, use
+`config.disabledPackages`.
+
+```yaml
+config:
+  disabledPackages:
+    - catalog: catalog
+      kind: task
+      packages:
+        - name: unsafe-task
+        - name: legacy-task
+          versions:
+            - "0.1"
+    - catalog: catalog-pipelines
+      kind: pipeline
+      packages:
+        - name: deprecated-pipeline
+```
+
+When installing through the ACP cluster plugin, place this YAML in the advanced
+values field if the form does not expose `config.disabledPackages` directly.
+
+## Verification
+
+For ConfigMap-backed repositories, check that the updated ConfigMap was
+accepted and that the source is ready:
+
+```bash
+kubectl describe configmap artifacthub-shim-team-a-tasks \
+  -n artifacthub-shim-system
+```
+
+Expected Events are `RepositoryConfigAccepted` and `RepositorySourceReady`.
+Then verify from the DevOps Hub UI or from the workload that uses
+`resolver: hub` that the disabled package or version is no longer selectable or
+resolvable.
+
+For built-in or static filesystem catalog rules, check the chart-managed pod
+rollout and the `artifacthub-shim` logs:
+
+```bash
+kubectl rollout status deployment/artifacthub-shim -n artifacthub-shim-system
+kubectl logs -n artifacthub-shim-system deployment/artifacthub-shim --tail=200
+```
+
+The logs include source status lines that show which repositories are Ready,
+Invalid, or Degraded after the rule is applied.
+
+## Notes
+
+- Disabled packages are removed from list, search, detail, and resolver API
+  responses.
+- ConfigMap delete, label removal, or disabled package changes remove the
+  affected repository content from the next snapshot.
+- Transient Git failures may keep serving the last successful source shard, but
+  explicit disable rules do not keep serving disabled content.
+
+## Learn More
+
+- [Configure Custom Git Repositories](configure_custom_git_repositories.mdx)
+- [Troubleshoot repository source visibility](../trouble_shooting/repository_source_not_visible.mdx)

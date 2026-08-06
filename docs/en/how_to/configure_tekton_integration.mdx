@@ -1,0 +1,81 @@
+---
+weight: 10
+category: howto
+---
+
+# Configure Tekton Integration
+
+## Feature Overview
+
+`artifacthub-shim` serves Tekton catalog resources through Artifact
+Hub-compatible APIs. Tekton hub resolver and Pipelines as Code should use the
+in-cluster shim Service, not public `artifacthub.io` or `api.hub.tekton.dev`.
+
+Standard ACP DevOps 4.13 installations use these defaults:
+
+| Setting | Value |
+| --- | --- |
+| Shim namespace | `artifacthub-shim-system` |
+| Shim Service | `artifacthub-shim-api` |
+| Resolver Artifact Hub API | `http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local/` |
+| PAC Hub URL | `http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local` |
+| Task catalog | `catalog` |
+| Pipeline catalog | `catalog-pipelines` |
+
+## Tekton Hub Resolver
+
+When the plugin uses the standard namespace and release name, ACP DevOps 4.13
+sets the resolver defaults during component installation. For custom
+installations, merge this configuration into `TektonConfig.spec.pipeline`:
+
+```yaml
+enable-hub-resolver: true
+hub-resolver-config:
+  artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local/
+  default-artifact-hub-task-catalog: catalog
+  default-artifact-hub-pipeline-catalog: catalog-pipelines
+  default-kind: task
+  default-tekton-hub-catalog: catalog
+  default-type: artifact
+```
+
+`default-tekton-hub-catalog` must stay present even when `default-type` is
+`artifact`; current resolver versions still read it while preparing defaults.
+
+If `artifacthub-shim` is installed into another namespace, replace
+`artifacthub-shim-system` in `artifact-hub-api` with the install namespace.
+If the Helm release name changes and the Service name is overridden, update the
+Service host as well.
+
+## Pipelines as Code
+
+PAC remote annotations use PAC settings, not `TektonConfig` resolver settings.
+For custom installations, set these PAC settings on the
+`OpenShiftPipelinesAsCode` resource or the reconciled PAC configuration source:
+
+```yaml
+hub-url: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+hub-catalog-type: artifacthub
+hub-catalog-name: catalog
+```
+
+Do not append `/api/v1` to `hub-url`; PAC adds it for Artifact Hub providers.
+Keep `hub-catalog-type: artifacthub` so PAC does not probe `/api/v1/stats` and
+fall back to Tekton Hub behavior.
+
+PAC has one default `hub-catalog-name`. It therefore asks shim for remote
+Pipeline annotations from `catalog`; shim falls back to `catalog-pipelines` for
+Pipeline detail lookups. New explicit hub resolver references should still use
+`catalog-pipelines` for Pipelines.
+
+## DevOps Hub UI
+
+The DevOps UI keeps the stable `/hub` gateway path. The chart renders a
+dedicated `hubIngress` that rewrites `/hub(/|$)(.*)` to the canonical shim API.
+The shim API itself does not register `/hub/**` handlers.
+
+## Related Content
+
+- [Quick Start](../quick_start.mdx)
+- [Consume Resources with the Hub Resolver](consume_resources_with_hub_resolver.mdx)
+- [Historical Pipeline Catalog References](../trouble_shooting/historical_pipeline_catalog.mdx)

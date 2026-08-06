@@ -1,0 +1,141 @@
+---
+weight: 10
+category: howto
+---
+
+# Author Catalog Resources
+
+`artifacthub-shim` indexes Tekton resources from filesystem and Git catalog
+sources. A catalog can contain `Task`, `Pipeline`, and `StepAction` resources.
+Each resource is versioned by directory and exposed through the DevOps Hub UI,
+Artifact Hub-compatible APIs, and Tekton `resolver: hub`.
+
+## Directory Layout
+
+Use this layout for a catalog repository:
+
+```text
+catalog-repo/
+├── task/
+│   └── run-script/
+│       └── 0.1/
+│           ├── README.md
+│           └── run-script.yaml
+├── pipeline/
+│   └── build-deploy/
+│       └── 0.1/
+│           ├── README.md
+│           └── build-deploy.yaml
+├── stepaction/
+│   └── echo-message/
+│       └── 0.1/
+│           ├── README.md
+│           └── echo-message.yaml
+└── config/
+    ├── overview_template/
+    │   └── run-script-overview-template.yaml
+    └── tool_image/
+        └── run-script-custom-image.yaml
+```
+
+Rules:
+
+- The top-level directory is the lowercase resource kind: `task`, `pipeline`, or
+  `stepaction`.
+- A version directory must contain one YAML manifest named after the resource.
+- `metadata.name` must match the package directory name.
+- `metadata.labels["app.kubernetes.io/version"]` should match the version
+  directory.
+- `README.md` is recommended because it is shown in UI detail pages.
+- Optional resource directories such as `config/` can contain ConfigMaps that
+  are synchronized through `extraResources` instead of indexed as catalog
+  packages. Use this for supporting resources such as overview templates and
+  tool image selector options. See
+  [Configure Custom Git Repositories](../../how_to/configure_custom_git_repositories.mdx),
+  [Customize Task Overview with Templates](./customize_task_overview_with_templates.mdx),
+  and [Add Custom Task Images to Selector](./add_custom_task_images_to_selector.mdx).
+
+## Required Metadata
+
+Every indexed resource should include a description and version metadata:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: echo-hello
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.56.0"
+    tekton.dev/categories: "CLI"
+    tekton.dev/tags: "echo,demo"
+    tekton.dev/displayName: "Echo Hello"
+    tekton.dev/platforms: "linux/amd64,linux/arm64"
+spec:
+  description: Simple demonstration Task that echoes a message.
+  params:
+    - name: message
+      description: Message to echo.
+      default: "Hello World"
+  steps:
+    - name: echo
+      image: alpine:3.21
+      script: |
+        #!/usr/bin/env sh
+        set -eu
+        echo "$(params.message)"
+```
+
+Keep `ClusterTask` out of new catalog content. Tekton Pipelines v1 uses
+namespaced `Task` resources.
+
+## Resolver References
+
+Use `type: artifact` when resolving resources through `artifacthub-shim`.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: echo-hello-run
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: echo-hello
+      - name: version
+        value: "0.1"
+```
+
+Built-in catalog names:
+
+| Resource kind | Built-in catalog |
+| --- | --- |
+| `task` | `catalog` |
+| `pipeline` | `catalog-pipelines` |
+| `stepaction` | `catalog-stepactions` |
+
+The built-in StepAction catalog is registered only when the packaged catalog
+contains a `stepaction/` directory.
+
+For complete resolver syntax, see
+[Consume Resources with the Hub Resolver](../../how_to/consume_resources_with_hub_resolver.mdx).
+
+## Validation Checklist
+
+- The path follows `<kind>/<name>/<version>/<name>.yaml`.
+- The manifest name and directory name match.
+- The version label matches the version directory.
+- `spec.description` is present and useful.
+- Parameters, workspaces, and results have descriptions.
+- Samples and README examples use `type: artifact`.
+- Additional ConfigMaps that must be synced to the cluster have
+  `artifacthub-shim.alauda.io/import: "true"`.

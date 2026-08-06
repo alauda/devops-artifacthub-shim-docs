@@ -1,0 +1,380 @@
+---
+weight: 10
+category: feature
+---
+
+# Chart Configuration
+
+This document describes the common Helm values for `artifacthub-shim`. The chart
+defaults are optimized for a lightweight, offline-friendly installation with the
+built-in Tekton catalog and no persistent runtime storage.
+
+Use `charts/artifacthub-shim/values.yaml` as the source of truth for the full
+value schema. The sections below focus on the values operators most commonly
+override.
+
+## Basic settings
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `namespaceOverride` | `""` | Installs workload resources into this namespace instead of the Helm release namespace. When `config.namespace` is empty, repository ConfigMaps and Secrets are watched from the pod namespace as well. |
+| `replicaCount` | `1` | Number of API replicas. Each replica builds and serves its own read-only snapshot. See [High Availability](high_availability.mdx) before increasing this value. |
+| `global.registry.address` | `registry.alauda.cn:60070` | Registry prefix used for chart images. Set this to the air-gapped registry mirror in production environments. Leave it empty only when image repositories already include a registry prefix. |
+| `global.registry.imagePullSecrets` | `[]` | Image pull secrets added to the pod spec. |
+| `global.images.api.*` | varies | API server image repository, tag, digest metadata, and pull policy. Runtime pod image references use `repository:tag`. |
+| `global.images.extension.*` | varies | Extension webhook image repository, tag, digest metadata, and pull policy. The first extension capability is template rendering for catalog TaskRuns. Runtime pod image references use `repository:tag`. |
+| `global.images.catalog.*` | varies | Built-in catalog image used by the `copy-catalog` init container when `catalog.enabled=true`. Runtime pod image references use `repository:tag`. |
+| `global.images.catalog_*.*` | varies | Catalog tool image inventory copied from the catalog release for offline packaging discovery. These entries are not referenced by the chart workload templates. |
+| `podSecurityContext` | restricted-compatible defaults | Pod-level security context. Defaults set a non-root UID/GID, `fsGroup`, and `seccompProfile.type=RuntimeDefault` so the chart can run in namespaces that enforce the Kubernetes `restricted` Pod Security profile. |
+| `securityContext` | restricted-compatible defaults | Container-level security context shared by the API container and the built-in `copy-catalog` init container. Defaults disable privilege escalation, drop all Linux capabilities, and use a read-only root filesystem. |
+
+## Built-in catalog
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `catalog.enabled` | `true` | Enables the built-in catalog image. The chart runs an init container that copies catalog files into a pod-local volume before the API server starts. This is the recommended default for offline installations. |
+| `catalog.extraResources.enabled` | `true` | Synchronizes labeled ConfigMap resources from the built-in catalog directory at runtime. |
+| `catalog.extraResources.path` | `config` | Relative directory under the built-in catalog root that contains ConfigMap resource YAML files. Only `v1/ConfigMap` documents with `artifacthub-shim.alauda.io/import: "true"` are imported; other files and resources are skipped. The path must not escape the catalog root. |
+| `catalog.mountPath` | `/var/lib/artifacthub-shim/catalog` | Runtime path mounted into the API container and exposed as `ARTIFACTHUB_SHIM_CATALOG_ROOT`. |
+| `catalog.initialPath` | `/var/lib/initial/catalog` | Path inside the built-in catalog image copied by the init container. |
+
+When `catalog.enabled=true` and `config.sources` is empty, the process creates
+default sources for `task` and `pipeline` under the catalog root. The optional
+`catalog-stepactions` source is created only when the packaged catalog contains a
+`stepaction/` directory.
+Set `catalog.enabled=false` when you provide only custom static sources or only
+ConfigMap-backed Git repository sources.
+
+## Extension webhook
+
+`artifacthub-shim-extension` is a separate Deployment from the API server. It
+does not serve Artifact Hub APIs; it hosts admission webhook capabilities used
+by catalog integrations. The first enabled capability is template rendering for
+TaskRuns that carry the configured template-render parameters.
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `extension.enabled` | `true` | Deploys the extension Deployment, Service, RBAC, Certificate/Issuer, and MutatingWebhookConfiguration. |
+| `extension.replicaCount` | `1` | Number of extension webhook replicas. |
+| `extension.service.port` | `443` | Service port used by the Kubernetes admission webhook client. |
+| `extension.service.targetPort` | `9443` | HTTPS webhook container port. |
+| `extension.webhook.failurePolicy` | `Ignore` | Admission failure policy for the template-render webhook. |
+| `extension.webhook.path` | `/mutate/render/template` | Webhook HTTP path. |
+| `extension.webhook.certManager.enabled` | `true` | Renders cert-manager Issuer and Certificate resources and injects the CA bundle into the webhook configuration. |
+| `extension.templateRender.detailsURLTemplate` | ACP PipelineRun/TaskRun URL template | Go template used to build detail links for rendered templates. |
+| `extension.templateRender.timeZone` | `""` | Optional time zone override for template rendering. |
+| `extension.templateRender.params.*` | `renderTemplateName`, `renderTemplateNamespace`, `renderTemplateValues` | TaskRun parameter names consumed by the template-render webhook. |
+| `extension.resources` | `{}` | CPU and memory requests and limits for the extension container. |
+| `extension.podLabels` | `{}` | Additional extension pod template labels. |
+| `extension.podAnnotations` | `{}` | Additional extension pod template annotations. |
+
+When `extension.webhook.certManager.enabled=true`, the target cluster must have
+cert-manager installed. If certificate management is provided externally, set
+`extension.webhook.certManager.enabled=false` and provide the configured webhook
+certificate Secret name through `extension.webhook.certManager.secretName`.
+The API and extension Deployments both use the root `nodeSelector`,
+`tolerations`, `affinity`, and `priorityClassName` scheduling values.
+
+## Runtime refresh and repository discovery
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `config.listenAddress` | `":8080"` | HTTP bind address inside the container. This rarely needs to change because the Service targets the named `http` port. |
+| `config.sources` | `""` | Optional comma-separated static source descriptors in the form `kind:name:path[:displayName]`. Static paths are relative to `ARTIFACTHUB_SHIM_CATALOG_ROOT`. |
+| `config.disabledPackages` | `[]` | Disabled package rules for static catalog sources. Rules are scoped by catalog and kind. |
+| `config.refreshInterval` | `10m` | Background refresh interval after the first published snapshot. Shorter intervals pick up repository changes faster but increase source loading, CPU, memory, and disk I/O load. |
+| `config.initialSyncTimeout` | `15m` | Timeout for the initial source load phase. If some sources fail or exceed this window, the process still publishes a diagnostic snapshot with source statuses so readiness can become true after the first refresh attempt finishes. |
+| `config.sourceLoadTimeout` | `15m` | Timeout for loading one registered catalog source. For Git-backed sources, this includes credential resolution, clone or fetch, checkout, cleanup, and source scanning. |
+| `config.enableConfigMapSources` | `true` | Enables repository sources declared by labeled ConfigMaps. The watched ConfigMaps must have `artifacthub-shim.alauda.io/repository: "true"` and a `repository.yaml` data key containing a `gitRepositories` list. Current ConfigMap-backed sources are Git-backed. |
+| `config.extraResourceSync.enabled` | `true` | Enables runtime ConfigMap resource synchronization from the built-in catalog and ConfigMap-backed Git `extraResources` directories. Only ConfigMaps with `artifacthub-shim.alauda.io/import: "true"` are imported. |
+| `config.extraResourceSync.allowedNamespaces` | `[kube-public]` | Namespaces that may receive synchronized ConfigMaps. The chart renders ConfigMap write RBAC only for these namespaces. |
+| `config.extraResourceSync.leaderElection.enabled` | `true` | Uses a Kubernetes Lease so only one replica writes or prunes ConfigMaps while all replicas continue serving API traffic. |
+| `config.extraResourceSync.leaderElection.leaseName` | `""` | Optional custom Lease name. Empty renders a release-scoped default. |
+| `config.namespace` | `""` | Namespace watched for repository ConfigMaps and Secrets. Empty means the pod namespace. The chart creates Role and RoleBinding resources in the watched namespace. |
+| `config.repositoryEventDebounce` | `2s` | Debounce window for ConfigMap and Secret watch events. Increase it if many repository objects are updated together. |
+| `config.sourceWorkDir` | `/var/lib/artifacthub-shim/sources` | Runtime path for source materialization and provider caches. The chart mounts this path from `storage.sourceWorkDir`. |
+| `config.maxConcurrentSources` | `4` | Maximum number of catalog sources loaded in parallel by one pod during a refresh. Cluster-wide refresh concurrency is approximately `replicaCount * config.maxConcurrentSources`. |
+| `config.maxBatchQuerySize` | `200` | Maximum number of resources/items accepted by one UI query request. The unit is resource metadata entries, so the default allows up to 200 resources per request; it is not a duration, byte size, or QPS value. This value is exposed as `ARTIFACTHUB_SHIM_MAX_BATCH_QUERY_SIZE`, currently also caps UI list endpoint page size, and matches `tektoncd-hubs-api` `MAX_QUERY_SIZE` by default. UI batch request bodies are also hard-capped at 1 MiB before JSON decoding. |
+| `config.globalCluster.enabled` | `false` | Uses the global-cluster default Hub UI IngressClass (`global-alb2`) when `hubIngress.className` is empty. This no longer injects Erebus or Kubernetes endpoint environment variables. |
+| `config.authentication.enabled` | `true` | Enables request authentication and authorization for UI-compatible endpoints. Resolver-compatible Artifact Hub endpoints remain unauthenticated. |
+| `config.authentication.kubernetesFallback` | `true` | Enables current-cluster Kubernetes `TokenReview` fallback after platform and OIDC authentication backends. |
+| `config.authentication.platform.mode` | `auto` | Platform authentication mode. `auto` uses platform auth when `platformURL` and `clusterName` are configured directly or discovered from `kube-public/global-info`; `enabled` requires platform config; `disabled` skips it. |
+| `config.authentication.platform.platformURL` | `""` | Optional ACP platform URL. Empty falls back to `kube-public/global-info` `platformURL`. |
+| `config.authentication.platform.clusterName` | `""` | Optional ACP cluster name. Empty falls back to `kube-public/global-info` `clusterName`. |
+| `config.authentication.platform.insecureSkipTLSVerify` | `true` | Skips TLS certificate verification when contacting the ACP platform Kubernetes endpoint. Set to `false` when the pod trust bundle can verify the ACP platform certificate. |
+| `config.authentication.oidc.enabled` | `false` | Enables explicit OIDC token verification between platform auth and Kubernetes fallback. |
+| `config.authentication.oidc.issuerURL` | `""` | Trusted OIDC issuer URL. Empty falls back to `kube-public/global-info` `oidcIssuer` when available. |
+| `config.authentication.oidc.audiences` | `[]` | Accepted OIDC token audiences. Empty falls back to `kube-public/global-info` `oidcClientID` when available. |
+| `config.authentication.oidc.usernameClaims` | `[]` | Username claims checked in order. Empty uses the shared requestauth default. |
+| `config.authentication.oidc.groupsClaims` | `[]` | OIDC claim names mapped to Kubernetes groups. |
+| `config.authentication.oidc.rolesClaims` | `[]` | OIDC role claim names mapped to Kubernetes groups. |
+| `config.authentication.oidc.userPrefix` | `""` | Prefix added to mapped usernames. |
+| `config.authentication.oidc.groupPrefix` | `""` | Prefix added to mapped groups. |
+| `config.authentication.oidc.requiredClaims` | `{}` | Required string claims that must match exactly. |
+| `config.authentication.oidc.requireEmailVerified` | `false` | Requires `email_verified=true` when the email claim is used as username. |
+| `config.authentication.oidc.ca.secretRef.name` | `""` | Optional Secret in the install namespace containing a PEM CA bundle for private OIDC issuers. |
+| `config.authentication.oidc.ca.secretRef.key` | `ca.crt` | Secret data key for the OIDC CA bundle. |
+| `config.authentication.oidc.clockSkew` | `2m` | OIDC token time validation leeway. |
+
+## Logging
+
+The chart writes JSON logs at `info` level by default. See
+[Logging](logging.mdx) for advanced zap file configuration.
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `logging.level` | `info` | Minimum enabled process log level when no zap config file is used. Valid values are `debug`, `info`, `warn`, and `error`. |
+| `logging.format` | `json` | Log encoder format when no zap config file is used. Valid values are `json` and `console`. |
+| `logging.configFile` | `""` | Optional path to a mounted YAML or JSON `zap.Config` file. When set, the process ignores `logging.level` and `logging.format`. |
+| `logging.config` | `{}` | Inline `zap.Config` rendered by the chart into `/etc/artifacthub-shim/logging.yaml`. Mutually exclusive with `logging.configFile`. |
+
+## UI API RBAC \{#ui-api-rbac}
+
+The chart grants the API ServiceAccount permission to read
+`kube-public/global-info` and to create `TokenReview` and
+`SubjectAccessReview` objects. The process protects UI-compatible endpoints with
+the shared `requestauth` flow:
+
+- `GET` and `POST` collection endpoints under `/api/v1alpha1/{tasks,pipelines,stepactions}` require `list hub.tekton.dev/resources`.
+- Detail endpoints under `/api/v1alpha1/{catalog}/{kind}/{name}[/version]` and raw manifest URLs under `/v1/resource/{catalog}/{kind}/{name}/{version}/yaml` require `get hub.tekton.dev/resources`.
+- Platform authentication is attempted first when enabled and when `platformURL` and `clusterName` are configured directly or discovered from `kube-public/global-info`. It sends the request bearer token to `{platformURL}/kubernetes/{clusterName}` and uses platform `SelfSubjectReview` plus `SelfSubjectAccessReview`.
+- Explicit OIDC verification is attempted next only when `config.authentication.oidc.enabled=true`. OIDC-authenticated users are authorized with current-cluster `SubjectAccessReview`.
+- Current-cluster Kubernetes `TokenReview` fallback is attempted last when `config.authentication.kubernetesFallback=true`, and the returned user is authorized with current-cluster `SubjectAccessReview`.
+- The process does not accept tokens by only decoding an unsigned Dex/JWT payload; tokens must be accepted by one of the configured shared backends.
+- Resolver-compatible Artifact Hub endpoints under `/api/v1/packages/...` remain unauthenticated so Tekton hub resolver can continue to call them without an end-user token.
+
+No Erebus or `KUBERNETES_SERVICE_HOST` environment injection is required for
+platform authentication. If the Hub UI Ingress must use the global-cluster
+IngressClass, set `config.globalCluster.enabled=true` or set
+`hubIngress.className` explicitly.
+
+## Runtime storage
+
+`sourceWorkDir` is storage for materialized repository sources and provider
+caches. For current ConfigMap-backed Git sources, this is where checkouts are
+kept between refreshes. Persisting it can reduce pod-recreation cost by avoiding
+a full reclone. During the first refresh after startup, a PVC-backed workdir can
+serve a valid persisted checkout without waiting for a network fetch; later
+refreshes still fetch, check out the requested revision, scan source files, and
+rebuild the in-memory metadata index.
+
+PVC-backed `sourceWorkDir` storage is supported only for single-replica
+deployments. With multiple replicas, use `emptyDir` so every pod owns an
+independent checkout directory.
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `storage.sourceWorkDir.type` | `emptyDir` | Storage backend for source materialization. Valid values are `emptyDir`, `pvc`, and `existingPVC`. `pvc` and `existingPVC` require `replicaCount: 1`. |
+| `storage.sourceWorkDir.emptyDir.sizeLimit` | `""` | Optional size limit for the `emptyDir` source workdir. |
+| `storage.sourceWorkDir.pvc.storageClassName` | `""` | StorageClass for a chart-created source workdir PVC. Empty uses the cluster default StorageClass. |
+| `storage.sourceWorkDir.pvc.size` | `5Gi` | Requested size for a chart-created source workdir PVC. |
+| `storage.sourceWorkDir.pvc.accessModes` | `[ReadWriteOnce]` | Access modes for a chart-created source workdir PVC. Any PVC-backed source workdir with `replicaCount>1` is rejected by chart validation. |
+| `storage.sourceWorkDir.pvc.existingClaim` | `""` | Existing PVC name used when `storage.sourceWorkDir.type=existingPVC`. |
+
+`ContentStore` is optional storage for immutable Tekton manifest and README
+payloads. It stores payload bytes by digest. It is not the metadata index: the
+package index, version lookup maps, search tokens, and source status are still
+built in memory for each pod.
+
+The default is `storage.contentStore.enabled=false`, which keeps manifest and
+README payloads in the in-memory snapshot. This is the simplest mode and is
+appropriate for the built-in catalog and small custom catalog sets.
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `storage.contentStore.enabled` | `false` | Enables filesystem-backed payload storage. When false, the chart does not render the `content-store` volume, volume mount, content store directory env var, or PVC. |
+| `storage.contentStore.type` | `emptyDir` | Storage backend when ContentStore is enabled. Valid values are `emptyDir`, `pvc`, and `existingPVC`. `pvc` and `existingPVC` require `replicaCount: 1`. |
+| `storage.contentStore.mountPath` | `/var/lib/artifacthub-shim/content` | Path mounted into the API container when ContentStore is enabled. |
+| `storage.contentStore.maxBytes` | `""` | Optional soft limit for total content store size. It is required when `type=existingPVC` because the chart cannot infer the capacity of an existing claim. |
+| `storage.contentStore.emptyDir.sizeLimit` | `2Gi` | Size limit for the `emptyDir` content store. |
+| `storage.contentStore.pvc.storageClassName` | `""` | StorageClass for a chart-created PVC. Empty uses the cluster default StorageClass. |
+| `storage.contentStore.pvc.size` | `5Gi` | Requested size for a chart-created PVC. |
+| `storage.contentStore.pvc.accessModes` | `[ReadWriteOnce]` | Access modes for a chart-created PVC. Any PVC-backed ContentStore with `replicaCount>1` is rejected by chart validation. |
+| `storage.contentStore.pvc.existingClaim` | `""` | Existing PVC name used when `storage.contentStore.type=existingPVC`. |
+
+For multi-replica deployments, keep ContentStore disabled unless there is a
+measured memory issue. If you must enable it with multiple replicas, prefer
+`emptyDir` so each pod has independent local payload storage. PVC-backed
+runtime storage is single-replica only.
+
+When either `sourceWorkDir` or enabled ContentStore uses PVC-backed storage, the
+chart renders the Deployment with `strategy.type: Recreate` to avoid old and new
+pods writing the same runtime storage during an upgrade.
+
+## Cache and payload limits
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `cache.payloadCacheSize` | `128Mi` | In-process hot payload cache size for digest-backed payload reads. This is most relevant when ContentStore is enabled. |
+| `cache.maxManifestBytes` | `1Mi` | Maximum accepted size for one Tekton manifest file. Oversized files are rejected for that source or version to protect memory and response size. |
+| `cache.maxReadmeBytes` | `2Mi` | Maximum accepted size for one README file. Raise this only for catalog repositories that legitimately need larger documentation payloads. |
+
+## Network exposure
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `service.type` | `ClusterIP` | Kubernetes Service type. Use `ClusterIP` for in-cluster resolver and UI traffic. Use `NodePort` only when direct node access is required. |
+| `service.port` | `80` | Service port. |
+| `service.targetPort` | `8080` | API container port. The Service targets the named `http` port rendered from this value. |
+| `service.nodePort` | `null` | Optional fixed node port rendered only when `service.type=NodePort`. |
+| `service.annotations` | `{}` | Service annotations for platform-specific integrations. |
+| `hubIngress.enabled` | `true` | Enables the DevOps Hub UI Ingress that rewrites `/hub(/&#124;$)(.*)` traffic to the API Service. |
+| `hubIngress.className` | `""` | IngressClass name for the Hub UI Ingress. Empty auto-selects `global-alb2` when `config.globalCluster.enabled=true`, otherwise `cpaas-system`. Set a non-empty value to override it. |
+| `hubIngress.annotations` | NGINX rewrite annotations | Ingress annotations for the Hub UI rewrite. |
+| `hubIngress.hosts` | hostless `/hub(/&#124;$)(.*)` rule | Host and path rules for the Hub UI Ingress. Empty host renders a hostless rule. |
+| `hubIngress.tls` | `[]` | TLS entries for the Hub UI Ingress. |
+| `ingress.enabled` | `false` | Enables an Ingress that routes to the API Service. |
+| `ingress.className` | `""` | Optional IngressClass name. |
+| `ingress.annotations` | `{}` | Ingress annotations. |
+| `ingress.hosts` | example host | Host and path rules. The default path routes `/` with `Prefix`. |
+| `ingress.tls` | `[]` | TLS entries for the rendered Ingress. |
+
+## Resources and scheduling
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `resources` | `100m/128Mi` request, `500m/512Mi` limit | CPU and memory requests and limits for the API container. Increase memory for many catalog repositories or large README payloads, especially when ContentStore is disabled. |
+| `nodeSelector` | `{}` | Node selector for scheduling pods. |
+| `tolerations` | `[]` | Pod tolerations. |
+| `affinity` | `{}` | Pod affinity and anti-affinity. Use pod anti-affinity if you want replicas spread across nodes. |
+| `priorityClassName` | `""` | Optional pod priority class. |
+
+## Extension points
+
+| Value | Default | Description |
+| --- | --- | --- |
+| `extraEnv` | `[]` | Additional environment variables for the API container. Values here can override variables imported from the generated ConfigMap, so use them deliberately. |
+| `extraInitContainers` | `[]` | Additional init containers appended after the built-in `copy-catalog` init container. Use this to populate shared pod volumes before the API container starts. |
+| `extraVolumes` | `[]` | Additional pod volumes. Commonly used with `extraVolumeMounts` for static catalog test data or trusted CA bundles. |
+| `extraVolumeMounts` | `[]` | Additional API container volume mounts. |
+| `podAnnotations` | `{}` | Additional pod template annotations. |
+| `podLabels` | `{}` | Additional pod template labels. |
+
+## Example: minimal offline installation
+
+This keeps the built-in catalog enabled and keeps manifest/README payloads in
+the in-memory snapshot.
+
+```yaml
+global:
+  registry:
+    address: registry.example.com/alauda
+  images:
+    api:
+      repository: devops/artifacthub-shim/artifacthub-shim-api
+      tag: v0.1.0
+    extension:
+      repository: devops/artifacthub-shim/artifacthub-shim-extension
+      tag: v0.1.0
+    catalog:
+      repository: devops/tektoncd/hub/catalog
+      tag: v0.1.0
+
+catalog:
+  enabled: true
+  extraResources:
+    enabled: true
+    path: config
+
+config:
+  extraResourceSync:
+    enabled: true
+    allowedNamespaces:
+      - kube-public
+    leaderElection:
+      enabled: true
+
+storage:
+  contentStore:
+    enabled: false
+
+service:
+  type: ClusterIP
+
+extension:
+  enabled: true
+```
+
+## Example: external access
+
+Use one of these patterns when a test client or external integration must reach
+the service directly.
+
+```yaml
+service:
+  type: NodePort
+  nodePort: 30080
+```
+
+```yaml
+service:
+  type: ClusterIP
+
+ingress:
+  enabled: true
+  className: nginx
+  hosts:
+    - host: artifacthub-shim.example.com
+      paths:
+        - path: /
+          pathType: Prefix
+  tls:
+    - secretName: artifacthub-shim-tls
+      hosts:
+        - artifacthub-shim.example.com
+```
+
+## Example: persistent source workdir
+
+Use this for single-replica deployments with large external repository sources
+when full reclones are a noticeable part of pod restart time. This persists
+materialized source checkouts, not the metadata index. After a pod recreation,
+the first refresh can publish from the persisted checkout before performing a
+network fetch.
+
+```yaml
+replicaCount: 1
+
+storage:
+  sourceWorkDir:
+    type: pvc
+    pvc:
+      size: 10Gi
+      accessModes:
+        - ReadWriteOnce
+```
+
+## Example: larger catalog with ContentStore
+
+Use this only when repository count or payload size creates measurable memory
+pressure. The index metadata still stays in memory, but manifest and README
+payload bytes are stored on the pod filesystem and read through the payload
+cache.
+
+```yaml
+config:
+  refreshInterval: 30m
+  initialSyncTimeout: 5m
+  sourceLoadTimeout: 15m
+  maxConcurrentSources: 2
+
+storage:
+  contentStore:
+    enabled: true
+    type: emptyDir
+    emptyDir:
+      sizeLimit: 10Gi
+
+cache:
+  payloadCacheSize: 256Mi
+  maxManifestBytes: 2Mi
+  maxReadmeBytes: 8Mi
+
+resources:
+  requests:
+    cpu: 200m
+    memory: 512Mi
+  limits:
+    cpu: "1"
+    memory: 1Gi
+```

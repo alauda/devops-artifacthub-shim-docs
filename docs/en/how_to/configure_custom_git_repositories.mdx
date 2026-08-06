@@ -1,0 +1,459 @@
+---
+weight: 20
+category: howto
+---
+
+# Configure Custom Git Repositories
+
+## Feature Overview
+
+`artifacthub-shim` can load additional Tekton catalog resources from Git
+repositories. Repositories are declared in labeled ConfigMaps. If a Git
+repository is private or uses an internal CA, its repository entry can reference
+a Secret in the same watched namespace.
+
+The same Git repository entry can also declare `extraResources` directories.
+Those directories are synchronized to the cluster as ConfigMaps when
+`config.extraResourceSync.enabled=true`.
+
+Each nested repository `name` becomes the external catalog name used by
+Artifact Hub API paths, UI paths, and Tekton hub resolver `catalog` parameters.
+Treat it as a stable identifier.
+
+## Prerequisites
+
+- `artifacthub-shim` is installed and ready.
+- `config.enableConfigMapSources` is `true`.
+- You can create ConfigMaps and Secrets in the namespace watched by
+  `artifacthub-shim`. By default, this is the install namespace.
+- The Git repository follows the expected catalog layout.
+- Runtime ConfigMap resource sync is enabled when you want to import
+  `extraResources` directories. By default, only the `kube-public` namespace is
+  allowed.
+
+## Repository Layout
+
+The `path` field points to one resource-kind directory inside the Git
+repository. Under that path, each package has version directories.
+
+```text
+task/
+  run-script/
+    0.1/
+      README.md
+      run-script.yaml
+pipeline/
+  build-deploy/
+    0.2/
+      README.md
+      build-deploy.yaml
+stepaction/
+  echo-message/
+    0.1/
+      README.md
+      echo-message.yaml
+```
+
+For each version directory, `artifacthub-shim` first looks for
+`<package>.yaml` or `<package>.yml`. If neither exists, it falls back to the
+single Tekton YAML file whose Kubernetes `kind` matches the configured source
+kind.
+
+## Repository ConfigMap
+
+Each repository ConfigMap must have the
+`artifacthub-shim.alauda.io/repository: "true"` label and a `repository.yaml`
+data key. The `repository.yaml` payload must contain a `gitRepositories` list.
+Each `gitRepositories[]` item declares one Git source. Each nested
+`repositories[]` item declares one externally visible catalog repository loaded
+from that Git source. If any item in a ConfigMap is invalid, `artifacthub-shim`
+rejects the whole ConfigMap.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-team-a-catalogs
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-a/tekton-catalog.git
+        revision: main
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+            path: task
+          - name: team-a-pipelines
+            displayName: Team A Pipelines
+            kind: pipeline
+            path: pipeline
+          - name: team-a-stepactions
+            displayName: Team A StepActions
+            kind: stepaction
+            path: stepaction
+        extraResources:
+          - path: config
+```
+
+Supported `kind` values:
+
+| Kind | Tekton resource |
+| --- | --- |
+| `task` | `Task` |
+| `pipeline` | `Pipeline` |
+| `stepaction` | `StepAction` |
+
+Supported top-level `repository.yaml` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `gitRepositories` | Yes | List of Git sources to register from this ConfigMap. |
+
+Supported `gitRepositories[]` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `url` | Yes | Git repository URL. |
+| `revision` | Yes | Branch, tag, or commit to check out. |
+| `credentialRef.name` | No | Secret name containing Git credentials. |
+| `repositories` | No | Catalog repositories loaded from this Git source. Required unless `extraResources` is set. |
+| `extraResources` | No | ConfigMap resource directories synchronized from this Git source. Required unless `repositories` is set. |
+
+Supported `gitRepositories[].repositories[]` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Stable catalog name used by resolver and API paths. Use this value as the hub resolver `catalog` parameter. |
+| `displayName` | No | Human-readable catalog name. |
+| `kind` | Yes | One of `task`, `pipeline`, or `stepaction`. |
+| `path` | Yes | Relative catalog path inside the Git repository. |
+| `disabledPackages` | No | Repository-local package or version disable rules. |
+
+Supported `gitRepositories[].extraResources[]` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `path` | Yes | Relative resource directory path inside the Git repository. The directory is scanned recursively. |
+
+## ConfigMap Resource Sync
+
+`extraResources` currently imports only `apiVersion: v1`, `kind: ConfigMap`
+documents that opt in with
+`metadata.labels["artifacthub-shim.alauda.io/import"]` set to `"true"`.
+Add this label to the ConfigMap YAML stored in the Git repository. Unlabeled
+ConfigMaps, non-ConfigMap resources, and unrelated files are skipped. Each
+imported ConfigMap must set `metadata.name` and `metadata.namespace`. The
+namespace must be listed in
+`config.extraResourceSync.allowedNamespaces`; the chart default is `kube-public`.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-a-tool-image
+  namespace: kube-public
+  labels:
+    artifacthub-shim.alauda.io/import: "true"
+data:
+  image: registry.example.com/team-a/tool:v1
+```
+
+Resource paths must stay inside the Git repository checkout. Symbolic links are
+not followed during resource scans.
+
+The resource sync controller automatically stamps synchronized in-cluster
+ConfigMaps with artifacthub-shim ownership labels such as
+`artifacthub-shim.alauda.io/controller-namespace`,
+`artifacthub-shim.alauda.io/controller-name`, and
+`artifacthub-shim.alauda.io/resource-set`. If a same-name ConfigMap already
+exists but does not have matching ownership labels, artifacthub-shim skips it
+and never adopts or overwrites it.
+
+When two resource sources declare the same desired ConfigMap, the conflict is
+handled per ConfigMap object. Other ConfigMaps from the same sources continue to
+sync. If the built-in catalog declares one of the duplicates, the built-in
+catalog version wins; otherwise the duplicate ConfigMap is skipped until the
+source manifests are made unique.
+
+When a synchronized ConfigMap disappears from the source directory,
+artifacthub-shim deletes it from the cluster. To keep a synchronized ConfigMap
+after it is removed from Git, add this annotation to the in-cluster ConfigMap:
+
+```yaml
+metadata:
+  annotations:
+    artifacthub-shim.alauda.io/resource-policy: keep
+```
+
+## Supported Credentials
+
+The referenced Secret can contain one or more of these keys:
+
+| Secret key | Use |
+| --- | --- |
+| `username` | HTTPS username. |
+| `password` | HTTPS password. |
+| `token` | HTTPS token. Used as the password when `password` is empty. |
+| `sshPrivateKey` | SSH private key. |
+| `ssh-privatekey` | Alternative SSH private key key name. |
+| `known_hosts` | SSH known hosts content. Required when `sshPrivateKey` or `ssh-privatekey` is set. |
+| `ca.crt` | CA bundle for internal HTTPS Git servers. |
+
+Each Git repository can reference a different Secret.
+
+## Examples
+
+### Public HTTPS Repository
+
+Use this pattern when the Git repository does not require authentication.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-public-tasks
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/platform/public-tekton-catalog.git
+        revision: main
+        repositories:
+          - name: public-tasks
+            displayName: Public Tasks
+            kind: task
+            path: task
+```
+
+### HTTPS Repository with Token
+
+Use `token` for Git providers that accept personal access tokens or deploy
+tokens over HTTPS. When `username` is omitted, `artifacthub-shim` uses
+`oauth2` as the username for the Git credential prompt.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-a-token
+  namespace: artifacthub-shim-system
+type: Opaque
+stringData:
+  token: <git-token>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-team-a-tasks
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-a/tekton-catalog.git
+        revision: main
+        credentialRef:
+          name: team-a-token
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+            path: task
+```
+
+### HTTPS Repository with Username and Password
+
+Use this pattern when your Git server requires a username and password pair.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-b-basic-auth
+  namespace: artifacthub-shim-system
+type: Opaque
+stringData:
+  username: <git-username>
+  password: <git-password>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-team-b-pipelines
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-b/tekton-catalog.git
+        revision: release-1.0
+        credentialRef:
+          name: team-b-basic-auth
+        repositories:
+          - name: team-b-pipelines
+            displayName: Team B Pipelines
+            kind: pipeline
+            path: pipeline
+```
+
+### SSH Repository with known_hosts
+
+Use `sshPrivateKey` or `ssh-privatekey` for SSH authentication. The Secret must
+also provide `known_hosts`; host key verification is strict by default.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: team-c-ssh
+  namespace: artifacthub-shim-system
+type: Opaque
+stringData:
+  sshPrivateKey: |
+    -----BEGIN OPENSSH PRIVATE KEY-----
+    <private-key>
+    -----END OPENSSH PRIVATE KEY-----
+  known_hosts: |
+    git.example.com ssh-ed25519 <host-key>
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-team-c-stepactions
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: ssh://git@git.example.com/team-c/tekton-catalog.git
+        revision: main
+        credentialRef:
+          name: team-c-ssh
+        repositories:
+          - name: team-c-stepactions
+            displayName: Team C StepActions
+            kind: stepaction
+            path: stepaction
+```
+
+### HTTPS Repository with Internal CA
+
+Use `ca.crt` when the Git server presents a certificate signed by an internal
+CA. You can combine `ca.crt` with `token`, `username`, or `password` in the
+same Secret.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: internal-git-token
+  namespace: artifacthub-shim-system
+type: Opaque
+stringData:
+  token: <git-token>
+  ca.crt: |
+    -----BEGIN CERTIFICATE-----
+    <ca-certificate>
+    -----END CERTIFICATE-----
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: artifacthub-shim-internal-tasks
+  namespace: artifacthub-shim-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.internal.example.com/devops/tekton-catalog.git
+        revision: main
+        credentialRef:
+          name: internal-git-token
+        repositories:
+          - name: internal-tasks
+            displayName: Internal Tasks
+            kind: task
+            path: task
+```
+
+## Use with the Hub Resolver
+
+The nested `repositories[].name` is the catalog value used by the hub resolver.
+For example, the `team-a-tasks` repository declared above is consumed with
+`catalog: team-a-tasks`:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: run-team-a-task
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: team-a-tasks
+      - name: kind
+        value: task
+      - name: name
+        value: run-script
+      - name: version
+        value: "0.1.0"
+  params:
+    - name: script
+      value: echo docs-verify
+```
+
+## Verification
+
+After applying the ConfigMap and optional Secret, inspect the Events on the
+repository ConfigMap:
+
+```bash
+kubectl describe configmap artifacthub-shim-team-a-catalogs \
+  -n artifacthub-shim-system
+```
+
+Expected Events:
+
+- `RepositoryConfigAccepted` means `repository.yaml` was accepted.
+- `RepositorySourceReady` means the repository source was indexed and is now
+  visible to the DevOps Hub UI and hub resolver clients.
+
+You can also list recent repository ConfigMap Events directly:
+
+```bash
+kubectl get events -n artifacthub-shim-system \
+  --field-selector involvedObject.kind=ConfigMap,involvedObject.name=artifacthub-shim-team-a-catalogs
+```
+
+If the repository does not become visible, check for
+`RepositoryConfigInvalid`, `RepositorySourceInvalid`, or
+`RepositorySourceDegraded` Events first. Use the `artifacthub-shim` pod logs as
+the secondary source for full Git or manifest parsing details.
+
+For persistent Warning states, `artifacthub-shim` records the Warning again on
+each refresh or resource sync attempt. Kubernetes usually keeps this as one
+Event with an increasing count and updated last timestamp. If event TTL cleanup
+removes the previous Event, the next attempt can create it again.
+
+Kubernetes Events are still historical and may keep older Warning entries until
+event TTL cleanup. Prefer the latest repository Event and `/api/v1/snapshot`
+source statuses when deciding whether the current configuration is healthy.
+
+## Learn More
+
+- [Disable Catalog Packages](disable_catalog_packages.mdx)
+- [Troubleshoot repository source visibility](../trouble_shooting/repository_source_not_visible.mdx)

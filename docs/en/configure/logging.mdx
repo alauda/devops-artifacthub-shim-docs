@@ -1,0 +1,105 @@
+---
+weight: 30
+category: feature
+---
+
+# Logging
+
+`artifacthub-shim` uses `zap` for structured process logs. The default chart
+configuration writes JSON logs to stdout at `info` level, which is suitable for
+Kubernetes log collection.
+
+## Configure level and format
+
+Use `logging.level` and `logging.format` for the common cases:
+
+```yaml
+logging:
+  level: debug
+  format: json
+```
+
+Supported levels are `debug`, `info`, `warn`, and `error`. Supported formats
+are `json` and `console`.
+
+The chart renders these values to:
+
+| Environment variable | Description |
+| --- | --- |
+| `ARTIFACTHUB_SHIM_LOG_LEVEL` | Minimum enabled log level when no config file is used. |
+| `ARTIFACTHUB_SHIM_LOG_FORMAT` | Log encoder format when no config file is used. |
+
+Use `debug` temporarily when diagnosing repository refresh, indexing, or API
+request behavior. Return to `info` after the investigation because per-source
+and request-level debug logs can be verbose.
+
+## Use a zap config file
+
+For advanced logging needs, provide a YAML or JSON file that follows the
+`zap.Config` structure. When `ARTIFACTHUB_SHIM_LOG_CONFIG_FILE` is set, the
+process reads that file during startup and ignores `ARTIFACTHUB_SHIM_LOG_LEVEL`
+and `ARTIFACTHUB_SHIM_LOG_FORMAT`.
+
+The chart can render the file from `logging.config`:
+
+```yaml
+logging:
+  config:
+    level: debug
+    encoding: console
+    outputPaths:
+      - stdout
+    errorOutputPaths:
+      - stderr
+    disableCaller: false
+    disableStacktrace: true
+    encoderConfig:
+      messageKey: message
+      levelKey: level
+      timeKey: ts
+      callerKey: caller
+      levelEncoder: lowercase
+      timeEncoder: iso8601
+      durationEncoder: string
+      callerEncoder: short
+```
+
+This creates a ConfigMap and mounts it at
+`/etc/artifacthub-shim/logging.yaml`. The process receives
+`ARTIFACTHUB_SHIM_LOG_CONFIG_FILE=/etc/artifacthub-shim/logging.yaml`.
+
+You can also mount your own file and point the chart at it:
+
+```yaml
+logging:
+  configFile: /etc/custom-artifacthub-shim/logging.yaml
+
+extraVolumes:
+  - name: custom-logging
+    configMap:
+      name: artifacthub-shim-custom-logging
+
+extraVolumeMounts:
+  - name: custom-logging
+    mountPath: /etc/custom-artifacthub-shim/logging.yaml
+    subPath: logging.yaml
+    readOnly: true
+```
+
+Do not set `logging.config` and `logging.configFile` at the same time.
+
+## Apply changes
+
+The logger reads file-based configuration only during process startup. After
+changing `logging.level`, `logging.format`, `logging.config`, or a custom
+mounted config file, restart the deployment or perform a rollout restart:
+
+```bash
+kubectl rollout restart deployment artifacthub-shim -n artifacthub-shim-system
+```
+
+## Sensitive data
+
+The service does not log request bodies, Kubernetes Secrets, bearer tokens, or
+Authorization headers. Git URLs with user information are redacted before they
+are returned in logs or source status messages.

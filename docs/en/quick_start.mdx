@@ -1,0 +1,238 @@
+---
+weight: 40
+category: quickstart
+---
+
+# Quick Start
+
+This guide helps users who already run Tekton through `tektoncd-operator`
+connect Tekton hub resolver traffic to `artifacthub-shim`.
+
+`artifacthub-shim` provides an Artifact Hub-compatible API for Tekton `Task`,
+`Pipeline`, and `StepAction` catalogs. In an ACP environment, it is usually
+deployed as a cluster plugin and then referenced from `TektonConfig`.
+
+## Prerequisites
+
+- `tektoncd-operator` is installed and the `TektonConfig` resource exists.
+- You have permission to install ACP cluster plugins.
+- You have permission to edit the `TektonConfig` resource.
+- The cluster can pull the `artifacthub-shim` API image and the packaged
+  offline catalog image from the configured registry.
+
+## Process Overview
+
+| Step | Operation | Description |
+| --- | --- | --- |
+| 1 | Install `artifacthub-shim` | Deploy the ACP cluster plugin. |
+| 2 | Check readiness | Verify that the shim API pods are ready. |
+| 3 | Configure `TektonConfig` | Point the hub resolver Artifact Hub endpoint to the shim API service. |
+| 4 | Verify resolver configuration | Check the reconciled `hubresolver-config` ConfigMap. |
+| 5 | Test a hub reference | Resolve a catalog resource through `resolver: hub`. |
+
+## Step-by-Step Instructions
+
+### Step 1: Install the ACP cluster plugin
+
+Install the `artifacthub-shim` cluster plugin from the ACP cluster plugin
+management page.
+
+Use these settings for the first installation:
+
+| Field | Recommended value |
+| --- | --- |
+| Install Namespace | `artifacthub-shim-system` |
+| Enable Built-in Catalog | `true` |
+| Enable Template Render Extension | `true` |
+| Service Type | `ClusterIP` |
+| Replica Count | `1` |
+| Enable Content Store | `false` |
+
+`artifacthub-shim` protects UI-compatible endpoints with the shared DevOps/ACP
+request authentication chain. In ACP environments it discovers the platform URL,
+cluster name, OIDC issuer, and client ID from `kube-public/global-info`; no
+Erebus or Kubernetes endpoint environment injection is required.
+
+If you install `artifacthub-shim` in an ACP global cluster, enable
+**ACP Global Cluster Mode** so the Hub UI Ingress uses the global-cluster
+IngressClass by default:
+
+```yaml
+config:
+  globalCluster:
+    enabled: true
+```
+
+Leave this option disabled in normal business clusters. You can still override
+the IngressClass with `hubIngress.className` when needed. See
+[Chart configuration](configure/chart_configuration.mdx#ui-api-rbac) for the
+authentication and ingress settings.
+
+The default service name rendered by the chart is `artifacthub-shim-api`. With
+the default namespace, the in-cluster URL is:
+
+```text
+http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+```
+
+Keep the service internal unless an external test client must reach the API
+directly.
+
+The chart also enables a hostless DevOps Hub Ingress by default. It rewrites
+`/hub(/|$)(.*)` to the canonical shim API paths on `artifacthub-shim-api`.
+Do not configure Tekton resolver or PAC traffic through this Ingress; they
+should use the in-cluster Service URL.
+
+### Step 2: Check shim readiness
+
+Wait until the Deployment is available:
+
+```bash
+kubectl wait deployment/artifacthub-shim \
+  -n artifacthub-shim-system \
+  --for=condition=Available \
+  --timeout=5m
+```
+
+Then check the Pod ready status:
+
+```bash
+kubectl get pods \
+  -n artifacthub-shim-system \
+  -l app.kubernetes.io/name=artifacthub-shim
+```
+
+Expected output:
+
+```text
+NAME                                READY   STATUS    RESTARTS   AGE
+artifacthub-shim-xxxxxxxxxx-yyyyy   1/1     Running   0          1m
+```
+
+The API container readiness probe checks `/readyz`, so a ready Pod means a
+catalog snapshot is available. Inspect `/api/v1/snapshot` when a custom
+repository source is missing; source-level sync errors are reported there.
+
+### Step 3: Configure TektonConfig
+
+ACP DevOps 4.13 standard installations already point Tekton hub resolver
+defaults to `artifacthub-shim` when the plugin is installed in
+`artifacthub-shim-system` with release name `artifacthub-shim`. Edit
+`TektonConfig` only when you are validating an older installation, overriding
+defaults, or installing the plugin into a custom namespace or release name.
+
+Merge the following fields under `spec.pipeline`.
+
+```yaml
+apiVersion: operator.tekton.dev/v1alpha1
+kind: TektonConfig
+metadata:
+  name: config
+spec:
+  pipeline:
+    enable-hub-resolver: true
+    hub-resolver-config:
+      artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+      default-artifact-hub-task-catalog: catalog
+      default-artifact-hub-pipeline-catalog: catalog-pipelines
+      default-kind: task
+      default-tekton-hub-catalog: catalog
+      default-type: artifact
+```
+
+Keep any existing `spec.pipeline` fields that are unrelated to hub resolver
+configuration.
+
+:::info
+`hub-resolver-config` is the `TektonConfig` field. The operator reconciles it
+to the `hubresolver-config` ConfigMap used by the remote resolver controller.
+Do not manage `hubresolver-config` directly when Tekton is installed through
+`TektonConfig`.
+:::
+
+### Step 4: Verify the reconciled resolver ConfigMap
+
+Check the effective ConfigMap:
+
+```bash
+RESOLVER_NAMESPACE="$(kubectl get tektonconfig config \
+  -o jsonpath='{.spec.targetNamespace}')"
+
+kubectl get configmap hubresolver-config \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o yaml
+```
+
+The data should include:
+
+```yaml
+data:
+  artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+  default-artifact-hub-pipeline-catalog: catalog-pipelines
+  default-artifact-hub-task-catalog: catalog
+  default-kind: task
+  default-tekton-hub-catalog: catalog
+  default-type: artifact
+```
+
+Also verify that the hub resolver feature flag is enabled:
+
+```bash
+kubectl get configmap resolvers-feature-flags \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o jsonpath='{.data.enable-hub-resolver}{"\n"}'
+```
+
+Expected output:
+
+```text
+true
+```
+
+### Step 5: Resolve a catalog resource
+
+Create a `TaskRun` that references a Task from the built-in catalog. Replace
+`run-script` and `0.1.0` if your packaged catalog uses different resources.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: artifacthub-shim-hub-task
+  namespace: default
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: run-script
+      - name: version
+        value: "0.1.0"
+  params:
+    - name: script
+      value: echo docs-verify
+```
+
+Apply it:
+
+```bash
+kubectl apply -f taskrun.yaml
+kubectl get taskrun artifacthub-shim-hub-task -n default
+```
+
+If the resolver can fetch the remote Task manifest, the `TaskRun` should move
+past the resolution phase and create a Pod.
+
+## Learn More
+
+- [Configure custom Git repositories](how_to/configure_custom_git_repositories.mdx)
+- [Configure Tekton integration](how_to/configure_tekton_integration.mdx)
+- [Consume resources with the hub resolver](how_to/consume_resources_with_hub_resolver.mdx)
+- [Troubleshoot hub resolver failures](trouble_shooting/hub_resolver_cannot_resolve_resource.mdx)
+- [Tekton Hub Resolver](https://tekton.dev/docs/pipelines/hub-resolver/)
