@@ -20,3 +20,10 @@ internalRoutes:
   - '**/development/**/*'
   - '*/design/**/*'
   - '**/design/**/*'
+
+releaseNotes:
+  queryTemplates:
+    unfixed: |
+      project = <%= project %> AND affectedVersion in ("artifacthub-shim-<%= version %>") AND type = Bug AND status in (Cancelled) AND ReleaseNotesStatus = Publish
+    fixed: |
+      project = <%= project %> AND fixVersion in ("artifacthub-shim-<%= version %>") AND type = Bug AND status in (Done, Resolved) AND ReleaseNotesStatus = Publish

@@ -178,7 +178,7 @@ type ContentRef struct {
 - 不同 repository 下允许存在同名 Task/Pipeline/StepAction。搜索和 UI 列表不得仅按 `name` 去重，必须把 repository/catalog 展示出来；详情 API 和 resolver API 必须携带 repository/catalog。
 - 同一个 repository、同一个 kind、同一个 package name 下的不同 version 会合并为同一个 package 的版本列表；但这个 package identity 只能来自一个 source/package directory。
 - 同一个 repository、同一个 kind、同一个 package name、同一个 normalized version 出现多份 manifest 时视为该 source 的内容冲突，包括 `0.1` 与 `0.1.0` 归一化后冲突。冲突不会影响其他 repository。
-- 两个不同 ConfigMap 或 provider 如果声明了相同 `RepositorySource.Name`，首版直接判定为 repository name 配置冲突，不做隐式优先级、不做跨 source 合并。冲突组中的 source 都不会进入下一份快照；其他 repository 不受影响。后续若确实需要 overlay 或 priority，必须作为显式 shim-only 能力设计，并说明如何降级到 upstream Artifact Hub。
+- 两个不同 ConfigMap 或 provider 如果声明了相同 `RepositorySource.Name`，按 source 优先级解决冲突，不做跨 source 合并。优先级从高到低为：内置默认 catalog（filesystem 静态 source）> 部署所在（install/watch）namespace 下注册的 ConfigMap source > 其他 namespace 下的全局 ConfigMap source。当冲突组中存在唯一的最高优先级 source 时，该 source 保留并进入快照，其余同名 source 判为 `Invalid`（reason 说明被哪个更高优先级 source 顶替）；当最高优先级档位上存在多个 source（例如同一 namespace 内两个 ConfigMap 重名、或多个其他 namespace 的全局 source 互相重名）时视为无法裁决的配置冲突，整组 source 都不进入快照。这样设计的动机是防止任意租户在其他 namespace 注册一个同名的全局 source 就把内置 catalog 或本 namespace 的正牌 catalog 顶掉（DoS/抢注）。跨 source overlay/合并仍不支持，后续若需要必须作为显式 shim-only 能力设计，并说明如何降级到 upstream Artifact Hub。
 - `disabledPackages` 规则必须按 repository + kind + package name 生效，不能因为某个仓库禁用了 `buildah` 就隐藏另一个仓库中的 `buildah`。
 
 ## 开发实现思路
@@ -395,11 +395,17 @@ components:
     valuesReleasePath: values/release.yaml
 ```
 
-CI 和本地发布准备通过 `hack/sync-component-releases.sh` 从 build-nexus 下载对应 revision 的 catalog values release：
+catalog 镜像集合通过 GitOps 仓库中的 `shim-catalog-image-sync` TriggerTemplate 同步。该模板执行共享 `sync-chart-tag` Pipeline，读取 catalog 发布到
+`https://artifacts.alauda.io/repository/alauda-pipelines-catalog-manifests/catalog/<branch>/values.yaml`
+的 aggregate values，并由 `chart-values-tag-bump` Task 自动进入 mirror mode。
 
-- `catalog/<revision>/values/release.yaml`：作为镜像清单来源。
+mirror mode 会把 catalog aggregate values 中的 `global.images` 原样同步到 artifacthub-shim 的 `charts/artifacthub-shim/values.yaml` 和根 `values.yaml`：
 
-同步脚本把 catalog release 中的 `.global.images.catalog` 写入 artifacthub-shim 的 `global.images.catalog`，供 chart 默认内置 catalog initContainer 使用；catalog revision 只作为构建期锁定信息保存在 `components.yaml`，不暴露为 chart runtime value。其他工具镜像会同时写入根 `values.yaml` 和 chart `values.yaml` 的 `global.images.catalog_<key>`，供 ACP/violet 从 release metadata 或 plugin chart 中发现离线镜像；这些条目只作为离线打包 inventory，不被 chart workload 模板引用。
+- `global.images.catalog` 供 chart 默认内置 catalog initContainer 使用。
+- `global.images.catalog_<key>` 供 ACP/violet 从 release metadata 或 plugin chart 中发现离线工具镜像。
+- `repository`、`tag` 和已有 `digest` 会同步；artifacthub-shim 自有镜像条目不会被删除。
+
+`shim-catalog-image-sync` 默认同步 `main`，并以 `autoMerge=false` 创建人工审核 MR。需要验证开发分支时，可以创建等价 PipelineRun 并把 `upstreamBranch` 改为目标分支；同步分支为 `sync/artifacthub-shim-<upstreamBranch>`。catalog revision 只作为构建期锁定信息保存在 `components.yaml`，不暴露为 chart runtime value。
 
 catalog 附带的 ConfigMap 资源不再通过 Helm 普通资源安装。内置 catalog 镜像中的 `config` 目录会被 initContainer 一起复制到运行时 catalog volume，artifacthub-shim 在 `catalog.extraResources.enabled=true` 时递归扫描该目录并同步 ConfigMap。多副本部署通过 Kubernetes Lease leader election 保证只有一个副本执行写入和 prune。
 
@@ -409,7 +415,12 @@ catalog 正式迁移所需的目录、annotation、镜像发现 selector 和验�
 
 ### Artifact Hub 兼容 API
 
-shim 需要支持 Tekton resolver 真实依赖的 Artifact Hub API 子集，并为 UI 搜索能力补充 Artifact Hub search API。resolver 只依赖 package detail 和 package version-list 两类 endpoint；`/api/v1/packages/search` 主要服务 UI 和调试，不在 resolver 的关键路径中。
+shim 需要支持 Tekton resolver 真实依赖的 Artifact Hub API 子集，并保留 Artifact Hub search
+API 兼容能力。resolver 只依赖 package detail 和 package version-list 两类 endpoint；当前 ACP
+产品 UI 使用 `/api/v1alpha1/**`，也不会调用 `/api/v1/packages/search`。该 search endpoint 主要
+用于原生 Artifact Hub 客户端兼容、运维调试和未来客户端接入。因为请求没有可信的 Namespace
+上下文，它会搜索当前索引中的全部 catalog，包括其他项目或 Namespace scoped 的 catalog，
+不能作为产品 UI 的隔离访问路径。
 
 ```text
 GET /api/v1/packages/search
@@ -537,6 +548,63 @@ UI 兼容 API 默认启用请求级 RBAC，不提供安装开关，避免部署�
 Artifact Hub resolver API 不接入用户级 RBAC。Tekton hub resolver 调用
 `/api/v1/packages/...` 时不会携带最终用户 token；如果该路径要求 `Authorization`，会破坏 resolver
 兼容性。它的安全边界应通过 Service 暴露范围、NetworkPolicy 或网关白名单控制。
+
+### Catalog 可见性边界（软隔离）
+
+Catalog 的 project、namespace 和显式 Namespace 列表可见性只用于 UI 展示过滤和
+Hub ResolutionRequest 的 best-effort 准入，不构成内容保密或多租户硬隔离边界。
+各读取面的实际约束如下：
+
+| 接口面 | RBAC | Namespace 可见性过滤 | 边界 |
+| --- | --- | --- | --- |
+| `/api/v1/packages/search` | 无 | 无 | 返回当前索引中全部 catalog 的可搜索元数据，包括 scoped catalog |
+| `/api/v1/packages/tekton-{kind}/{repo}/{name}[/version]` | 无 | 无 | version detail 可通过 `data.manifestRaw` 返回完整 Tekton YAML |
+| `/api/v1alpha1/**` | UI RBAC | 仅请求显式携带 `namespace` 时过滤 | 省略 `namespace` 时保留兼容性的全量视图 |
+| `/v1/resource/**/yaml` | UI RBAC | 仅请求显式携带 `namespace` 时过滤 | 省略 `namespace` 时保留兼容性的全量 raw manifest 读取 |
+| Hub ResolutionRequest webhook | 内部 AccessReview 使用 ServiceAccount 认证 | 检查显式 Artifact Hub 或省略 type 的 Hub ResolutionRequest；显式 Tekton Hub 请求跳过 | 本地未知 catalog、参数或依赖异常会 fail open；`failurePolicy: Ignore` 允许 webhook 不可用时继续创建 |
+
+ResolutionRequest 在 admission 阶段不携带 resolver 最终使用的 API URL，也不能可靠关联到
+任意 Namespace 中的 resolver 实例。因此 extension 不读取 `hubresolver-config`，也不扫描
+resolver Deployment。它使用请求中显式的 `catalog`、`kind`、`name` 和 `version` 调用本地
+AccessReview；本地索引不存在的 catalog 返回 `not_found` 并放行。省略 `type` 的请求仍作为
+Artifact Hub 候选检查，缺少其余必需参数时 fail open。
+
+因此，集群内任何能够访问 shim Service 的 Pod 都可以直接调用原生 Artifact Hub API，
+枚举 scoped catalog 并读取其 manifest，而不经过 UI RBAC 或 ResolutionRequest webhook。
+Webhook 只影响匹配请求的准入，不能拦截直接 HTTP 访问。`private` 或 `scoped` 在这里表示
+受支持消费路径上的可见性，而不是机密数据存储承诺；需要硬隔离的内容必须由部署侧限制
+Service 网络可达性，或在未来引入 resolver 可信 Namespace/身份传递、原生 API 认证授权和
+fail-closed 策略。
+
+#### 产品 UI 接口的 Namespace 级隔离演进方案
+
+当前 UI API 在请求显式携带 `namespace` 时，已经把该值写入
+`hub.tekton.dev/resources` 虚拟 Kubernetes 资源的 `SubjectAccessReview` 属性，并分别使用
+`list` 或 `get` 鉴权。但 `namespace` 仍可为兼容旧客户端而省略，平台默认角色中也可能存在
+面向 Namespace/项目角色聚合的 cluster-scope Hub 权限，因此当前行为仍然只是软隔离。
+
+后续为产品 UI 接口增加 Namespace 级硬隔离时，按以下方案实施：
+
+1. 将 `hub.tekton.dev/resources` 明确定义为供 UI API 使用的 namespaced 虚拟资源。项目或
+   Namespace 视图发起的 `/api/v1alpha1/**` 和 `/v1/resource/**/yaml` 请求必须携带目标
+   Namespace，shim 必须在该 Namespace 下对 collection/batch 执行 `list` SAR，对
+   detail/raw manifest 执行 `get` SAR；非集群级调用不得回退到省略 Namespace 的全量视图。
+2. 虚拟资源权限按 Namespace 分配。Namespace 角色通过目标 Namespace 内的 RoleBinding
+   获得权限；项目角色由平台在项目包含的每个 Namespace 中分配同一权限。只有集群管理员、
+   平台管理员以及按产品定义需要全局只读能力的审计角色保留 cluster-scope 权限。
+3. 平台默认角色以
+   [`tektoncd-operator/config/system-roles`](https://code.alauda.io/alauda-pipelines/tektoncd-operator/-/tree/main/config/system-roles)
+   为配置入口：`tekton-pipelines-namespaced.yaml` 中的
+   `hub.tekton.dev/resources` 规则用于 Namespace 级绑定；集群/平台管理员的全局权限继续由
+   `tekton-cluster-admin.yaml` 管理。
+4. 必须移除或收紧 `tekton-cluster-admin.yaml` 中
+   `cpaas:tekton-cluster-resources:cluster:view` 对 `hub.tekton.dev/*` 的 cluster-scope 规则。
+   该角色当前会聚合给 Namespace 管理员、Namespace 开发者和项目管理员；如果保留，全局授权
+   会让这些角色在任意 Namespace 的 SAR 中继续被允许，从而绕过 Namespace 级权限分配。
+
+这套方案只收紧产品 UI API。resolver 依赖的 `/api/v1/packages/**` 仍缺少可信的最终用户和
+Namespace 上下文，不能通过同一个虚拟资源模型直接获得硬隔离；其风险仍需通过前述网络边界
+或后续 resolver/API 身份传递方案处理。
 
 ### 前端访问路径与开箱即用切换
 

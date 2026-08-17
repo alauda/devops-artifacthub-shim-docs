@@ -2,11 +2,13 @@
 
 本文记录 `artifacthub-shim` plugin chart 从 PR 流水线产物到目标平台上架的操作流程。内部环境优先使用快捷上架：确认 plugin chart 和镜像已经同步到目标 registry 后，直接在 global cluster 更新 `ModulePlugin`，由平台生成对应版本的 `ModuleConfig`。`violet` 大包流程只作为离线交付、无 global cluster 操作权限或自动生成 `ModuleConfig` 失败时的回退方案。
 
+如果目标环境使用独立镜像仓库，并且回归只需要 API、extension 与内置 catalog，请使用 [Selective artifact transfer for an air-gapped plugin upgrade](./selective-air-gapped-plugin-upgrade.md)。该流程不会传输 chart 中仅用于离线打包发现的 Task 工具镜像。
+
 ## 目标
 
 - 等待 PR 触发的 `as-all-in-one` PipelineRun 完成。
 - 从 `package-chart` 结果中获取 `plugin-chart-version`。
-- 确认 plugin chart 和相关镜像已经同步到 `registry.alauda.cn:60070`。
+- 确认 plugin chart 和相关镜像已经同步到 `registry-dev.alauda.io`。
 - 内部环境通过 `ModulePlugin` 快捷上架新版本。
 - 必要时使用 `violet push --skip-push` 回退更新平台侧上架信息。
 - 区分“上架新版本”和“升级已安装实例”。
@@ -30,7 +32,7 @@ export PIPELINE_KUBECONFIG=/path/to/pipeline-kubeconfig
 export PIPELINE_NAMESPACE=<pipeline-namespace>
 export TARGET_KUBECONFIG=/path/to/target-cluster-kubeconfig
 export TARGET_CLUSTER=<target-cluster-name>
-export DEST_REPO='registry.alauda.cn:60070'
+export DEST_REPO='registry-dev.alauda.io'
 ```
 
 如果需要使用 Violet 回退流程，再填写平台访问参数。平台密码不要写入脚本或提交到仓库，交互式读取即可：
@@ -107,7 +109,7 @@ kubectl --kubeconfig "$PIPELINE_KUBECONFIG" -n "$PIPELINE_NAMESPACE" \
 
 ## 验证目标 Registry
 
-上架时应使用 `registry.alauda.cn:60070` 作为目标 registry。先确认 chart 已经存在：
+上架时应使用 `registry-dev.alauda.io` 作为目标 registry。先确认 chart 已经存在：
 
 ```bash
 export CHART_REPO='devops/artifacthub-shim/charts/artifacthub-shim-plugin'
@@ -169,7 +171,7 @@ tar -xOzf "$CHART_TGZ" artifacthub-shim-plugin/module-plugin.yaml |
 
 - `spec.appReleases[].chartVersions[].version` 是否等于 `$PLUGIN_VERSION`。
 - `spec.mainChart` 是否为 `devops/artifacthub-shim/charts/artifacthub-shim-plugin`。
-- `values.yaml` 中 `global.registry.address` 是否为 `registry.alauda.cn:60070`。
+- `values.yaml` 中 `global.registry.address` 是否为 `registry-dev.alauda.io`。
 
 ## 内部环境快捷上架（推荐）
 

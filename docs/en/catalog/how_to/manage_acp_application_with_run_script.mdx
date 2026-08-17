@@ -91,7 +91,7 @@ tool image selector in the `run-script` Task UI.
 
 | Field | Value |
 | --- | --- |
-| Registry | `registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager` |
+| Registry | `registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager` |
 | Recommended tag | `v0.1` (pin for reproducibility; `latest` always reflects the newest fixed tag) |
 | Main tools | `kubectl-application` plugin, `kubectl` 1.33 |
 | Bundled tools | `yq` 4.47 |
@@ -304,7 +304,7 @@ spec:
       - { name: version, value: "0.1"  }
   params:
     - name: image
-      value: registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager:v0.1
+      value: registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager:v0.1
     - name: imagePullPolicy
       value: IfNotPresent
     - name: args
@@ -504,7 +504,7 @@ spec:
       - { name: version, value: "0.1"  }
   params:
     - name: image
-      value: registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager:v0.1
+      value: registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager:v0.1
     - name: imagePullPolicy
       value: IfNotPresent
     - name: args
@@ -577,7 +577,7 @@ spec:
       - { name: version, value: "0.1"  }
   params:
     - name: image
-      value: registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager:v0.1
+      value: registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager:v0.1
     - name: imagePullPolicy
       value: IfNotPresent
     - name: args
@@ -678,7 +678,7 @@ spec:
       description: Seconds to wait for the rollback to complete.
     - name: scriptImage
       type: string
-      default: registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager:v0.1
+      default: registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager:v0.1
       description: |
         Tool image containing kubectl and the kubectl-application plugin.
         Pin to a specific tag (e.g. v0.1) for reproducible runs.
@@ -1006,7 +1006,7 @@ spec:
       - { name: version, value: "0.1"  }
   params:
     - name: image
-      value: registry.alauda.cn:60070/devops/tektoncd/hub/kubectl-app-manager:v0.1
+      value: registry-dev.alauda.io/alauda-pipelines-catalog/hub/kubectl-app-manager:v0.1
     - name: imagePullPolicy
       value: IfNotPresent
     - name: args

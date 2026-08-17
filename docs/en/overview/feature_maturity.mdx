@@ -1,0 +1,41 @@
+---
+weight: 70
+queries:
+  - Which Artifact Hub Shim features are generally available?
+  - Is custom catalog support production ready?
+  - What is the maturity of Artifact Hub Shim features?
+---
+
+# Feature Maturity
+
+This page describes the maturity of Artifact Hub Shim capabilities. All
+capabilities listed below are generally available.
+
+## Maturity Levels
+
+| Level | Meaning |
+| --- | --- |
+| **Alpha** | Early development; behavior or APIs may change without notice. Not recommended for production workloads. |
+| **Beta** | Functional and reasonably stable; minor changes may occur with advance notice. Suitable for non-critical workloads. |
+| **GA** | Stable and production-ready; APIs and behavior follow the documented compatibility policy. |
+
+## Feature Maturity Overview
+
+| Area | Capability | Maturity | Description |
+| --- | --- | --- | --- |
+| Catalog | Built-in offline catalog | GA | Delivers ACP Task, Pipeline, StepAction, template, and tool-image resources without public internet access. |
+| Catalog | Git-backed custom catalogs | GA | Loads catalog resources from administrator-registered Git sources with supported credentials and source isolation. |
+| Catalog | Versioning and package filtering | GA | Supports version normalization, latest selection, aliases, conflict detection, and disabled-package rules. |
+| API | Tekton resolver compatibility | GA | Serves the Artifact Hub API subset required for Tekton hub resolution. |
+| API | DevOps Hub UI compatibility | GA | Serves authenticated list, detail, README, version, and raw-manifest APIs used by ACP DevOps. |
+| Access | Repository visibility | GA | Filters repositories globally, by project, by namespace, or by explicit namespace allowlist. |
+| Extension | Resolver visibility admission | GA | Validates local Tekton ResolutionRequests against configured repository visibility. |
+| Extension | TaskRun template rendering | GA | Renders catalog-provided mail and execution-overview templates through the optional webhook. |
+| Synchronization | Catalog extra resources | GA | Synchronizes approved ConfigMaps with ownership, conflict, prune, keep-policy, and namespace controls. |
+| Operations | Health and source observability | GA | Reports health, readiness, snapshot generation, and source-level synchronization status. |
+| Operations | High availability | GA | Supports multiple independent read replicas with pod-local storage and leader-elected resource synchronization. |
+| Platform | Air-gap, architecture, and network support | GA | Supports offline delivery, amd64 and arm64 images, and IPv4, IPv6, or dual-stack clusters. |
+
+GA describes product readiness, not long-term version maintenance. Artifact Hub
+Shim uses a latest-version-only maintenance model; see
+[Lifecycle Policy](./lifecycle_policy.mdx).

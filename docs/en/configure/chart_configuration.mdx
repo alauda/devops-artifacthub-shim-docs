@@ -19,7 +19,7 @@ override.
 | --- | --- | --- |
 | `namespaceOverride` | `""` | Installs workload resources into this namespace instead of the Helm release namespace. When `config.namespace` is empty, repository ConfigMaps and Secrets are watched from the pod namespace as well. |
 | `replicaCount` | `1` | Number of API replicas. Each replica builds and serves its own read-only snapshot. See [High Availability](high_availability.mdx) before increasing this value. |
-| `global.registry.address` | `registry.alauda.cn:60070` | Registry prefix used for chart images. Set this to the air-gapped registry mirror in production environments. Leave it empty only when image repositories already include a registry prefix. |
+| `global.registry.address` | `registry-dev.alauda.io` | Registry prefix used for chart images. Set this to the air-gapped registry mirror in production environments. Leave it empty only when image repositories already include a registry prefix. |
 | `global.registry.imagePullSecrets` | `[]` | Image pull secrets added to the pod spec. |
 | `global.images.api.*` | varies | API server image repository, tag, digest metadata, and pull policy. Runtime pod image references use `repository:tag`. |
 | `global.images.extension.*` | varies | Extension webhook image repository, tag, digest metadata, and pull policy. The first extension capability is template rendering for catalog TaskRuns. Runtime pod image references use `repository:tag`. |
@@ -61,12 +61,23 @@ TaskRuns that carry the configured template-render parameters.
 | `extension.webhook.failurePolicy` | `Ignore` | Admission failure policy for the template-render webhook. |
 | `extension.webhook.path` | `/mutate/render/template` | Webhook HTTP path. |
 | `extension.webhook.certManager.enabled` | `true` | Renders cert-manager Issuer and Certificate resources and injects the CA bundle into the webhook configuration. |
+| `extension.resolutionRequestPolicy.enabled` | `true` | Renders the validating webhook that checks Hub `ResolutionRequest` catalog visibility. Set to `false` for immediate rollback. |
+| `extension.resolutionRequestPolicy.path` | `/validate/hub-resolution-request` | HTTPS path served by the extension for Hub visibility validation. |
+| `extension.resolutionRequestPolicy.failurePolicy` | `Ignore` | Keeps PipelineRun and TaskRun creation available when the webhook cannot be reached. The handler also explicitly fails open on internal errors. |
+| `extension.resolutionRequestPolicy.timeoutSeconds` | `3` | Kubernetes admission timeout for the visibility check. |
 | `extension.templateRender.detailsURLTemplate` | ACP PipelineRun/TaskRun URL template | Go template used to build detail links for rendered templates. |
 | `extension.templateRender.timeZone` | `""` | Optional time zone override for template rendering. |
 | `extension.templateRender.params.*` | `renderTemplateName`, `renderTemplateNamespace`, `renderTemplateValues` | TaskRun parameter names consumed by the template-render webhook. |
-| `extension.resources` | `{}` | CPU and memory requests and limits for the extension container. |
+| `extension.resources` | `50m/64Mi/32Mi` request, `250m/256Mi/256Mi` limit | CPU, memory, and ephemeral-storage requests and limits for the extension container. |
 | `extension.podLabels` | `{}` | Additional extension pod template labels. |
 | `extension.podAnnotations` | `{}` | Additional extension pod template annotations. |
+
+The ResolutionRequest policy does not read `hubresolver-config` or discover the
+resolver Deployment. It skips requests that explicitly use Tekton Hub and
+reviews explicit Artifact Hub requests, plus requests that omit `type`, against
+the local shim index. Requests without explicit `catalog`, `kind`, `name`, or
+`version` parameters fail open because the webhook cannot safely reconstruct
+resolver defaults.
 
 When `extension.webhook.certManager.enabled=true`, the target cluster must have
 cert-manager installed. If certificate management is provided externally, set
@@ -86,6 +97,9 @@ The API and extension Deployments both use the root `nodeSelector`,
 | `config.initialSyncTimeout` | `15m` | Timeout for the initial source load phase. If some sources fail or exceed this window, the process still publishes a diagnostic snapshot with source statuses so readiness can become true after the first refresh attempt finishes. |
 | `config.sourceLoadTimeout` | `15m` | Timeout for loading one registered catalog source. For Git-backed sources, this includes credential resolution, clone or fetch, checkout, cleanup, and source scanning. |
 | `config.enableConfigMapSources` | `true` | Enables repository sources declared by labeled ConfigMaps. The watched ConfigMaps must have `artifacthub-shim.alauda.io/repository: "true"` and a `repository.yaml` data key containing a `gitRepositories` list. Current ConfigMap-backed sources are Git-backed. |
+| `config.globalConfigMapSources.enabled` | `true` | Enables cluster-wide discovery of repository ConfigMaps that explicitly opt in as globally visible Catalog Sources. Matching ConfigMaps outside the primary watched namespace must have both `artifacthub-shim.alauda.io/repository: "true"` and `artifacthub-shim.alauda.io/repository-visibility: "global"`. The chart renders cluster-scoped read RBAC when this is enabled. |
+| `config.globalConfigMapSources.allowedNamespaces` | `[]` | Exact allowlist for non-primary Namespaces that may declare `repository-visibility: global`. Empty means unrestricted. |
+| `config.scopedConfigMapSources.enabled` | `true` | Enables cluster-wide discovery of namespace, project, and explicit Namespace allowlist repository ConfigMaps. Non-primary ConfigMaps without a visibility label default to namespace scope. |
 | `config.extraResourceSync.enabled` | `true` | Enables runtime ConfigMap resource synchronization from the built-in catalog and ConfigMap-backed Git `extraResources` directories. Only ConfigMaps with `artifacthub-shim.alauda.io/import: "true"` are imported. |
 | `config.extraResourceSync.allowedNamespaces` | `[kube-public]` | Namespaces that may receive synchronized ConfigMaps. The chart renders ConfigMap write RBAC only for these namespaces. |
 | `config.extraResourceSync.leaderElection.enabled` | `true` | Uses a Kubernetes Lease so only one replica writes or prunes ConfigMaps while all replicas continue serving API traffic. |
@@ -135,8 +149,8 @@ The chart grants the API ServiceAccount permission to read
 `SubjectAccessReview` objects. The process protects UI-compatible endpoints with
 the shared `requestauth` flow:
 
-- `GET` and `POST` collection endpoints under `/api/v1alpha1/{tasks,pipelines,stepactions}` require `list hub.tekton.dev/resources`.
-- Detail endpoints under `/api/v1alpha1/{catalog}/{kind}/{name}[/version]` and raw manifest URLs under `/v1/resource/{catalog}/{kind}/{name}/{version}/yaml` require `get hub.tekton.dev/resources`.
+- `GET` and `POST` collection endpoints under `/api/v1alpha1/{tasks,pipelines,stepactions}` require `list hub.tekton.dev/resources`. When `namespace` is supplied, the SubjectAccessReview targets that Namespace and scope filtering happens before pagination or batch aggregation.
+- Detail endpoints under `/api/v1alpha1/{catalog}/{kind}/{name}[/version]` and raw manifest URLs under `/v1/resource/{catalog}/{kind}/{name}/{version}/yaml` require `get hub.tekton.dev/resources`. A hidden catalog returns `404` and generated links preserve the `namespace` query.
 - Platform authentication is attempted first when enabled and when `platformURL` and `clusterName` are configured directly or discovered from `kube-public/global-info`. It sends the request bearer token to `{platformURL}/kubernetes/{clusterName}` and uses platform `SelfSubjectReview` plus `SelfSubjectAccessReview`.
 - Explicit OIDC verification is attempted next only when `config.authentication.oidc.enabled=true`. OIDC-authenticated users are authorized with current-cluster `SubjectAccessReview`.
 - Current-cluster Kubernetes `TokenReview` fallback is attempted last when `config.authentication.kubernetesFallback=true`, and the returned user is authorized with current-cluster `SubjectAccessReview`.
@@ -233,7 +247,7 @@ pods writing the same runtime storage during an upgrade.
 
 | Value | Default | Description |
 | --- | --- | --- |
-| `resources` | `100m/128Mi` request, `500m/512Mi` limit | CPU and memory requests and limits for the API container. Increase memory for many catalog repositories or large README payloads, especially when ContentStore is disabled. |
+| `resources` | `100m/128Mi/64Mi` request, `500m/512Mi/1Gi` limit | CPU, memory, and ephemeral-storage requests and limits for the API container. Increase memory for many catalog repositories or large README payloads, especially when ContentStore is disabled. |
 | `nodeSelector` | `{}` | Node selector for scheduling pods. |
 | `tolerations` | `[]` | Pod tolerations. |
 | `affinity` | `{}` | Pod affinity and anti-affinity. Use pod anti-affinity if you want replicas spread across nodes. |

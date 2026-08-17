@@ -1,0 +1,45 @@
+[
+  "index.mdx",
+  {
+    "type": "dir",
+    "name": "overview",
+    "label": "Overview",
+    "collapsible": true,
+    "collapsed": false
+  },
+  "install.mdx",
+  {
+    "type": "dir",
+    "name": "configure",
+    "label": "Configure"
+  },
+  {
+    "type": "dir",
+    "name": "how_to",
+    "label": "How To"
+  },
+  {
+    "type": "dir",
+    "name": "catalog",
+    "label": "Catalog"
+  },
+  {
+    "type": "dir",
+    "name": "trouble_shooting",
+    "label": "Troubleshooting"
+  },
+  {
+    "type": "dir",
+    "name": "apis"
+  },
+  {
+    "type": "dir",
+    "name": "design",
+    "label": "Design"
+  },
+  {
+    "type": "dir",
+    "name": "development",
+    "label": "Development"
+  }
+]

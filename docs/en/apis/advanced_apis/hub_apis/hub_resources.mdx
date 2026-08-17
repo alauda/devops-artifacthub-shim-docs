@@ -1,0 +1,20 @@
+---
+weight: 40
+---
+
+import { OpenAPIPath } from '@alauda/doom/runtime'
+
+# Hub Resource APIs
+
+Retrieve the latest or a specific version of a Hub Task, Pipeline, or
+StepAction. Detail responses contain the available versions, README, manifest,
+and the URL of the raw YAML endpoint. Catalogs that are not visible from the
+requested Namespace return `404` and do not disclose resource metadata.
+
+<OpenAPIPath
+  path={[
+    '/api/v1alpha1/{catalog}/{kind}/{name}',
+    '/api/v1alpha1/{catalog}/{kind}/{name}/{version}',
+    '/v1/resource/{catalog}/{kind}/{name}/{version}/yaml',
+  ]}
+/>

@@ -1,0 +1,149 @@
+---
+weight: 40
+category: quickstart
+queries:
+  - How do I connect Tekton to Artifact Hub Shim?
+  - How do I verify a Task from Artifact Hub Shim?
+  - How do I configure the Tekton hub resolver for an offline catalog?
+---
+
+# Quick Start
+
+This guide connects an existing Tekton installation to Artifact Hub Shim and
+resolves one Task from the built-in catalog.
+
+## Prerequisites
+
+- Artifact Hub Shim is [installed](../install.mdx) and ready.
+- `Alauda DevOps Pipelines` v4.0 or later is installed.
+- You can edit `TektonConfig` and create a `TaskRun` in a test namespace.
+
+## Process Overview
+
+| Step | Operation | Expected Result |
+| --- | --- | --- |
+| 1 | Verify Artifact Hub Shim | The API reports healthy and ready. |
+| 2 | Configure Tekton | The hub resolver uses the in-cluster shim Service. |
+| 3 | Verify the resolver | The generated resolver ConfigMap contains the shim URL. |
+| 4 | Resolve a Task | A TaskRun progresses beyond remote resolution. |
+
+## Verify Artifact Hub Shim
+
+The following commands use the default namespace and Service name:
+
+```bash
+kubectl get deployment,service -n artifacthub-shim-system
+
+kubectl get --raw \
+  '/api/v1/namespaces/artifacthub-shim-system/services/http:artifacthub-shim-api:80/proxy/readyz'
+```
+
+The readiness response should contain `"status":"ready"`. A ready response
+means that the API has published a catalog snapshot.
+
+## Configure Tekton
+
+Standard ACP installations with Artifact Hub Shim integration may already
+contain the following settings. If the values are absent or the plugin uses a
+custom namespace, merge the applicable fields into `TektonConfig.spec.pipeline`:
+
+```yaml
+apiVersion: operator.tekton.dev/v1alpha1
+kind: TektonConfig
+metadata:
+  name: config
+spec:
+  pipeline:
+    enable-hub-resolver: true
+    hub-resolver-config:
+      artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+      default-artifact-hub-task-catalog: catalog
+      default-artifact-hub-pipeline-catalog: catalog-pipelines
+      default-kind: task
+      default-tekton-hub-catalog: catalog
+      default-type: artifact
+```
+
+Keep existing `spec.pipeline` fields that are unrelated to the hub resolver.
+For Pipelines as Code and non-default installations, see
+[Configure Tekton Integration](../how_to/configure_tekton_integration.mdx).
+
+## Verify the Resolver Configuration
+
+Find the Tekton target namespace and inspect the reconciled ConfigMap:
+
+```bash
+RESOLVER_NAMESPACE="$(kubectl get tektonconfig config \
+  -o jsonpath='{.spec.targetNamespace}')"
+
+kubectl get configmap hubresolver-config \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o jsonpath='{.data.artifact-hub-api}{"\n"}'
+```
+
+Expected output:
+
+```text
+http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+```
+
+Also verify that the resolver feature is enabled:
+
+```bash
+kubectl get configmap resolvers-feature-flags \
+  -n "${RESOLVER_NAMESPACE}" \
+  -o jsonpath='{.data.enable-hub-resolver}{"\n"}'
+```
+
+Expected output:
+
+```text
+true
+```
+
+## Resolve a Built-in Task
+
+Create a TaskRun that references version `0.1` of the `run-script` Task. If your
+packaged catalog offers another version, replace `0.1` with a listed version.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  generateName: artifacthub-shim-quick-start-
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: run-script
+      - name: version
+        value: "0.1"
+  params:
+    - name: script
+      value: echo artifacthub-shim-ready
+```
+
+Save the manifest as `taskrun.yaml`, apply it to a test namespace, and inspect
+the result:
+
+```bash
+kubectl apply -n <test-namespace> -f taskrun.yaml
+kubectl get taskrun -n <test-namespace>
+```
+
+Successful remote resolution causes Tekton to create the TaskRun pod. If the
+TaskRun remains in a resolution error, see
+[Hub Resolver Cannot Resolve a Resource](../trouble_shooting/hub_resolver_cannot_resolve_resource.mdx).
+
+## Next Steps
+
+- [Consume Resources with the Hub Resolver](../how_to/consume_resources_with_hub_resolver.mdx)
+- [Configure Custom Git Repositories](../how_to/configure_custom_git_repositories.mdx)
+- [Browse the Built-in Catalog](../catalog/index.mdx)

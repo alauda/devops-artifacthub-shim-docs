@@ -1,0 +1,66 @@
+---
+weight: 10
+queries:
+  - What is Alauda Artifact Hub Shim?
+  - How does ACP provide Tekton catalogs in an air-gapped environment?
+  - When should I use Artifact Hub Shim?
+---
+
+# Introduction
+
+`Alauda Artifact Hub Shim` is an ACP cluster plugin that provides an offline,
+Artifact Hub-compatible service for Tekton catalog resources. It gives Tekton
+hub resolvers and the DevOps Hub UI a stable in-cluster endpoint for discovering
+and retrieving `Task`, `Pipeline`, and `StepAction` resources without depending
+on a public Artifact Hub service.
+
+Artifact Hub Shim is intended for platform administrators and DevOps users who
+need a centrally managed catalog on ACP. Administrators install and configure
+the plugin, while pipeline authors consume catalog resources through Tekton
+remote references or browse them in the DevOps UI.
+
+## Key Benefits
+
+- **Air-gap ready**: the plugin, built-in catalog, and required tool images can
+  be delivered through the ACP offline package and private registry.
+- **Tekton-native consumption**: pipeline definitions use the standard Tekton
+  hub resolver contract instead of downloading Tasks at authoring time.
+- **Central catalog management**: administrators can combine the built-in
+  catalog with additional Git-backed catalogs registered through Kubernetes
+  `ConfigMap` resources.
+- **ACP integration**: the plugin supplies the compatibility APIs used by the
+  DevOps Hub UI and participates in ACP authentication and authorization for UI
+  requests.
+- **Operational resilience**: source failures are isolated, the last valid
+  snapshot remains available where possible, and the API supports multiple
+  read replicas with pod-local runtime storage.
+
+## Typical Scenarios
+
+- Use the built-in ACP catalog to reference reusable Tasks and Pipelines from
+  Tekton workloads.
+- Publish an internal Git repository as a private or organization-wide catalog.
+- Browse and inspect catalog resources from the DevOps Hub UI.
+- Deliver mail and execution-overview templates with catalog resources.
+- Keep tool-image and template `ConfigMap` resources synchronized into approved
+  namespaces.
+
+## Limitations
+
+- Artifact Hub Shim implements the Artifact Hub and legacy Hub API subsets
+  required by Tekton and ACP. It is not a general-purpose replacement for the
+  public Artifact Hub website or all Artifact Hub APIs.
+- Git-backed catalogs must be reachable from the cluster. In an air-gapped
+  environment, use an internal Git service and internal credentials.
+- Resolver-compatible Artifact Hub endpoints do not carry an end-user token.
+  Repository visibility on that path is enforced by the optional admission
+  extension and should not be treated as a boundary for untrusted direct API
+  clients. UI-compatible endpoints use ACP or Kubernetes authorization.
+- Artifact Hub Shim is maintained as a rolling release. Only the latest released
+  version receives fixes. See [Lifecycle Policy](./lifecycle_policy.mdx).
+
+## Next Steps
+
+- [Review the architecture](./architecture.mdx)
+- [Install Artifact Hub Shim](../install.mdx)
+- [Complete the quick start](./quick_start.mdx)

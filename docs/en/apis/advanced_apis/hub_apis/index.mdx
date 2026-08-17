@@ -1,0 +1,18 @@
+---
+weight: 10
+category: index
+---
+
+import { Overview } from '@alauda/doom/runtime'
+
+# Hub APIs
+
+Use the Hub APIs to list and retrieve Tekton Tasks, Pipelines, and StepActions
+indexed by Artifact Hub Shim.
+
+Send the current user's Bearer token with each request. Add the `namespace`
+query parameter for Workspace-aware authorization and catalog visibility
+filtering. Namespace-aware requests do not fall back to the unscoped catalog
+view when authorization fails.
+
+<Overview />

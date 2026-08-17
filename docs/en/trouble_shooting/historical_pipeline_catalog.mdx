@@ -14,7 +14,7 @@ repository.
 
 ## Current Compatibility
 
-`artifacthub-shim` provides a compatibility fallback for Pipeline lookups:
+`artifacthub-shim` provides a built-in catalog alias for Pipeline lookups:
 
 - `pipeline/catalog/<name>/<version>` falls back to
   `pipeline/catalog-pipelines/<name>/<version>`.
@@ -23,7 +23,9 @@ repository.
 - UI detail, UI batch, Artifact Hub detail, and legacy raw YAML paths share the
   same fallback.
 
-Fallback usage is logged at warning level and counted by
+Alias usage is logged at warning level with `catalog alias lookup used` and
+counted by `artifacthub_shim_catalog_alias_lookup_total`. The historical
+Pipeline alias also increments the compatibility metric
 `artifacthub_shim_pipeline_catalog_fallback_total`.
 
 ## Recommended Fix

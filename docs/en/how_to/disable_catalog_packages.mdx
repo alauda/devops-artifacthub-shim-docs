@@ -60,7 +60,7 @@ rule.
 
 ## Disable Packages in the Built-in Catalog
 
-For the built-in catalog or static filesystem sources, use
+For the built-in catalog or static filesystem sources, the Helm chart value is
 `config.disabledPackages`.
 
 ```yaml
@@ -79,8 +79,32 @@ config:
         - name: deprecated-pipeline
 ```
 
-When installing through the ACP cluster plugin, place this YAML in the advanced
-values field if the form does not expose `config.disabledPackages` directly.
+When artifacthub-shim is installed through the ACP cluster plugin, configure the
+same rules in `spec.config.extraConfigValues`. The plugin injects
+`extraConfigValues` into the chart `config:` block, so the value must not include
+the top-level `config:` key.
+
+Minimal `ModuleInfo` example:
+
+```yaml
+apiVersion: cluster.alauda.io/v1alpha1
+kind: ModuleInfo
+metadata:
+  name: edge-build-artifacthub-shim
+spec:
+  config:
+    extraConfigValues: |2-
+        disabledPackages:
+          - catalog: catalog
+            kind: task
+            packages:
+              - name: chart-build-push
+```
+
+Do not put `disabledPackages` directly under `spec.config` in `ModuleInfo`; that
+field is not rendered into the chart values. After the plugin upgrade rolls out,
+the generated `artifacthub-shim-config` ConfigMap should contain the rule under
+`ARTIFACTHUB_SHIM_DISABLED_PACKAGES`.
 
 ## Verification
 

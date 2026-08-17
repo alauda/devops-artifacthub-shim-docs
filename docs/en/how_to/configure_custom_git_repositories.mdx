@@ -26,6 +26,13 @@ Treat it as a stable identifier.
 - `config.enableConfigMapSources` is `true`.
 - You can create ConfigMaps and Secrets in the namespace watched by
   `artifacthub-shim`. By default, this is the install namespace.
+- To register globally visible repositories from another namespace,
+  `config.globalConfigMapSources.enabled` must be `true`. This is enabled by
+  default. `config.globalConfigMapSources.allowedNamespaces` can restrict which
+  namespaces may promote repositories to global visibility.
+- To register namespace, project, or explicit-allowlist repositories,
+  `config.scopedConfigMapSources.enabled` must be `true`. This is enabled by
+  default.
 - The Git repository follows the expected catalog layout.
 - Runtime ConfigMap resource sync is enabled when you want to import
   `extraResources` directories. By default, only the `kube-public` namespace is
@@ -69,6 +76,22 @@ Each `gitRepositories[]` item declares one Git source. Each nested
 from that Git source. If any item in a ConfigMap is invalid, `artifacthub-shim`
 rejects the whole ConfigMap.
 
+ConfigMaps in the primary watched namespace, configured by `config.namespace`,
+keep the existing behavior and default to global visibility. ConfigMaps in any
+other namespace default to visibility from only that namespace. Set
+`artifacthub-shim.alauda.io/repository-visibility` to `global`, `project`, or
+`namespace` to choose an explicit scope. Project membership is derived only
+from the owner Namespace label `cpaas.io/project`.
+
+The annotation
+`artifacthub-shim.alauda.io/repository-visible-namespaces` takes precedence over
+the visibility label. Its comma-separated value is an exact Namespace allowlist;
+entries are trimmed and deduplicated and may span projects. An empty value, an
+invalid Namespace name, or a list with no existing Namespace invalidates the
+whole ConfigMap scope and removes its previous content from the serving index.
+When only some Namespace entries do not exist, those entries are ignored and the
+remaining existing Namespaces continue to receive the repository.
+
 ```yaml
 apiVersion: v1
 kind: ConfigMap
@@ -98,6 +121,94 @@ data:
         extraResources:
           - path: config
 ```
+
+### Cross-namespace Global Repository ConfigMap
+
+Use this pattern when a plugin or administrator owns the repository ConfigMap in
+a namespace different from the artifacthub-shim watched namespace, but the
+catalog should still be globally visible. Global repository ConfigMap discovery
+is enabled by default and covers all namespaces. The chart grants
+artifacthub-shim cluster-scoped read access to ConfigMaps, referenced Secrets,
+and Events while this feature is enabled.
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-b-global-catalogs
+  namespace: team-b-system
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "global"
+data:
+  repository.yaml: |
+    gitRepositories:
+      - url: https://git.example.com/team-b/tekton-catalog.git
+        revision: main
+        credentialRef:
+          name: team-b-git-credential
+        repositories:
+          - name: team-b-global-tasks
+            displayName: Team B Global Tasks
+            kind: task
+            path: task
+```
+
+If `credentialRef.name` is set, the Secret is resolved in the same namespace as
+the repository ConfigMap. Secret changes in cross-namespace source namespaces
+are picked up on the next repository refresh; updating the repository ConfigMap
+also triggers an immediate refresh.
+
+### Namespace-scoped Repository ConfigMap
+
+This is the default for repository ConfigMaps outside the primary watched
+namespace. Only workloads and namespace-aware UI requests from `team-a` can use
+the catalog.
+
+```yaml
+metadata:
+  namespace: team-a
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "namespace"
+```
+
+### Project-scoped Repository ConfigMap
+
+All Namespaces whose `cpaas.io/project` label equals the owner Namespace label
+can use the catalog. If the owner has no project label, the scope is invalid.
+
+```yaml
+metadata:
+  namespace: team-a
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "project"
+```
+
+### Exact Namespace allowlist
+
+The annotation overrides any `global`, `project`, or `namespace` label:
+
+```yaml
+metadata:
+  namespace: team-a
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "project"
+  annotations:
+    artifacthub-shim.alauda.io/repository-visible-namespaces: team-a,team-c
+```
+
+Scoped ConfigMaps must not declare `extraResources`. A `credentialRef` always
+resolves a Secret in the repository ConfigMap Namespace and cannot reference a
+Secret in another Namespace.
+
+Namespace-aware UI APIs filter Task, Pipeline, and StepAction records before
+search, pagination, batch lookup, and content reads. Hub `ResolutionRequest`
+creation is also checked by the extension validating webhook. A denied request
+reports `CATALOG_VISIBILITY_DENIED`; unknown catalogs and internal policy errors
+are allowed through so the Hub resolver can return its native result.
 
 Supported `kind` values:
 
@@ -132,6 +243,52 @@ Supported `gitRepositories[].repositories[]` fields:
 | `kind` | Yes | One of `task`, `pipeline`, or `stepaction`. |
 | `path` | Yes | Relative catalog path inside the Git repository. |
 | `disabledPackages` | No | Repository-local package or version disable rules. |
+| `optional` | No | When `true`, a missing or empty `path` is published as `Ready` with zero packages. Defaults to `false`. |
+| `legacyCatalogAliases` | No | Historical catalog names that resolve to this repository for the same `kind`. API responses still return the canonical `name`. |
+
+### Optional kind paths and legacy catalog aliases
+
+Use `optional: true` only when a repository entry intentionally represents a
+kind directory that may not exist yet. This is mainly useful for migrated
+Tekton Hub catalogs where the old catalog had only `task/`, only `pipeline/`,
+or mixed kind coverage. Strict validation remains the default for hand-written
+repository entries.
+
+`legacyCatalogAliases` preserves old resolver references during migration. The
+alias is scoped by `kind`: a Pipeline alias does not resolve Tasks with the same
+catalog name. A self alias is ignored. If an alias points to multiple
+repositories or conflicts with another canonical repository name for that kind,
+the shim disables only that alias and keeps every canonical repository ready.
+
+Example migrated catalog:
+
+```yaml
+gitRepositories:
+  - url: https://git.example.com/team-a/tekton-hub-catalog.git
+    revision: main
+    repositories:
+      - name: team-a
+        displayName: Team A Tasks
+        kind: task
+        path: task
+        optional: true
+      - name: team-a-pipelines
+        displayName: Team A Pipelines
+        kind: pipeline
+        path: pipeline
+        optional: true
+        legacyCatalogAliases:
+          - team-a
+      - name: team-a-stepactions
+        displayName: Team A StepActions
+        kind: stepaction
+        path: stepaction
+        optional: true
+```
+
+With this configuration, old Pipeline references that still use
+`catalog: team-a` resolve to the canonical `team-a-pipelines` repository.
+New references should use `catalog: team-a-pipelines` directly.
 
 Supported `gitRepositories[].extraResources[]` fields:
 

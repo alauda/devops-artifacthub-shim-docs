@@ -183,8 +183,16 @@ Compare the hub resolver params with the repository source and catalog content:
 
 For built-in catalog resources, use `catalog` for Tasks and
 `catalog-pipelines` for Pipelines. Historical Pipeline references that still
-use `catalog` are supported by a shim fallback, but new references should use
-`catalog-pipelines`.
+use `catalog` are supported by a shim catalog alias, but new references should
+use `catalog-pipelines`.
+
+For migrated custom Tekton Hub catalogs, the operator may create repositories
+such as `team-a`, `team-a-pipelines`, and `team-a-stepactions`, with a
+legacy alias such as `team-a` pointing to the Pipeline repository for Pipeline
+lookups. API responses and UI labels still return the canonical repository name.
+If the resolver fails after migration, check the repository ConfigMap for
+`legacyCatalogAliases` and verify that the requested `kind` matches the alias
+scope.
 
 If the source is Ready but the package is still missing, check disabled package
 rules in the repository ConfigMap and chart values.
@@ -221,7 +229,7 @@ Then query logs from the matching resolver Deployment or Pod.
 
 ## Related Content
 
-- [Quick Start](../quick_start.mdx)
+- [Quick Start](../overview/quick_start.mdx)
 - [Consume Resources with the Hub Resolver](../how_to/consume_resources_with_hub_resolver.mdx)
 - [Configure Tekton Integration](../how_to/configure_tekton_integration.mdx)
 - [Historical Pipeline Catalog References](historical_pipeline_catalog.mdx)

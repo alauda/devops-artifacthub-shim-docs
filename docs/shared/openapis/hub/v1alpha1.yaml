@@ -1,0 +1,747 @@
+openapi: 3.0.3
+info:
+  title: Alauda DevOps Hub API
+  version: v1alpha1
+  description: >-
+    The Hub API lists and retrieves Tekton Tasks, Pipelines, and StepActions
+    indexed by Artifact Hub Shim. Namespace-aware requests authorize the caller
+    against the target Namespace and hide catalogs that are not visible there.
+servers:
+  - url: https://{server_url}/apis/hub
+    description: ACP API gateway entry point for the Hub API
+    variables:
+      server_url:
+        default: console.example.com
+        description: Hostname of the ACP console or API gateway
+tags:
+  - name: Tasks
+    description: List and batch-query Hub Tasks.
+  - name: Pipelines
+    description: List and batch-query Hub Pipelines.
+  - name: StepActions
+    description: List and batch-query Hub StepActions.
+  - name: Hub Resources
+    description: Retrieve Hub resource details and raw manifests.
+paths:
+  /api/v1alpha1/tasks:
+    get:
+      tags:
+        - Tasks
+      operationId: listHubTasks
+      summary: List Hub Tasks
+      description: >-
+        Returns the Tasks visible from the requested Namespace. Visibility
+        filtering happens before pagination. The API does not provide a
+        server-side text-search parameter; clients can search or filter the
+        returned list. This operation requires `list` permission on
+        `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/IncludeContent'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          description: The visible Hub Tasks.
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/HubResourceList'
+              example:
+                metadata: {}
+                items:
+                  - metadata:
+                      name: run-script
+                      uid: 3248f13064a355a7ec3d3b46d4f958ca
+                      labels:
+                        hub.tekton.dev/catalog: alauda
+                        hub.tekton.dev/catalog-type: artifact-hub
+                        hub.tekton.dev/category: shell
+                      annotations:
+                        hub.tekton.dev/displayName: Run Script
+                        hub.tekton.dev/description: Run a custom shell script.
+                    spec:
+                      version: '0.1'
+                      available_versions:
+                        - '0.1'
+                      apiPath: alauda/task/run-script?namespace=team-a
+                      tags:
+                        - shell
+                      readme: '# Run Script'
+                      platforms:
+                        - linux/amd64
+                      manifest: |-
+                        apiVersion: tekton.dev/v1
+                        kind: Task
+                        metadata:
+                          name: run-script
+                      manifestURL: /v1/resource/alauda/task/run-script/0.1.0/yaml?namespace=team-a
+                      description: Run a custom shell script.
+                      raw: {}
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags:
+        - Tasks
+      operationId: batchGetHubTasks
+      summary: Batch-query Hub Tasks
+      description: >-
+        Returns the requested Tasks in request order. The request is atomic: if
+        any resource is missing or not visible from the Namespace, the entire
+        request returns `404`. The default deployment accepts at most 200
+        entries and limits the JSON body to 1 MiB. This operation requires
+        `list` permission on `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+      requestBody:
+        $ref: '#/components/requestBodies/TaskBatchRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResourceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1alpha1/pipelines:
+    get:
+      tags:
+        - Pipelines
+      operationId: listHubPipelines
+      summary: List Hub Pipelines
+      description: >-
+        Returns the Pipelines visible from the requested Namespace. Visibility
+        filtering happens before pagination. The API does not provide a
+        server-side text-search parameter; clients can search or filter the
+        returned list. This operation requires `list` permission on
+        `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/IncludeContent'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResourceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags:
+        - Pipelines
+      operationId: batchGetHubPipelines
+      summary: Batch-query Hub Pipelines
+      description: >-
+        Returns the requested Pipelines in request order. The request is atomic:
+        if any resource is missing or not visible from the Namespace, the entire
+        request returns `404`. The default deployment accepts at most 200
+        entries and limits the JSON body to 1 MiB. This operation requires
+        `list` permission on `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+      requestBody:
+        $ref: '#/components/requestBodies/PipelineBatchRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResourceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1alpha1/stepactions:
+    get:
+      tags:
+        - StepActions
+      operationId: listHubStepActions
+      summary: List Hub StepActions
+      description: >-
+        Returns the StepActions visible from the requested Namespace. Visibility
+        filtering happens before pagination. The API does not provide a
+        server-side text-search parameter; clients can search or filter the
+        returned list. This operation requires `list` permission on
+        `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/IncludeContent'
+        - $ref: '#/components/parameters/Offset'
+        - $ref: '#/components/parameters/Limit'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResourceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+    post:
+      tags:
+        - StepActions
+      operationId: batchGetHubStepActions
+      summary: Batch-query Hub StepActions
+      description: >-
+        Returns the requested StepActions in request order. The request is
+        atomic: if any resource is missing or not visible from the Namespace,
+        the entire request returns `404`. The default deployment accepts at
+        most 200 entries and limits the JSON body to 1 MiB. This operation
+        requires `list` permission on `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Namespace'
+      requestBody:
+        $ref: '#/components/requestBodies/StepActionBatchRequest'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResourceList'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '413':
+          $ref: '#/components/responses/PayloadTooLarge'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1alpha1/{catalog}/{kind}/{name}:
+    get:
+      tags:
+        - Hub Resources
+      operationId: getLatestHubResource
+      summary: Get the latest Hub resource version
+      description: >-
+        Returns the latest indexed version of a Task, Pipeline, or StepAction,
+        including its available versions, README, manifest, and raw-manifest
+        URL. A catalog that is not visible from the Namespace is reported as
+        `404` to avoid disclosing private catalog contents. This operation
+        requires `get` permission on `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Catalog'
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/Name'
+        - $ref: '#/components/parameters/Namespace'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResource'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /api/v1alpha1/{catalog}/{kind}/{name}/{version}:
+    get:
+      tags:
+        - Hub Resources
+      operationId: getHubResourceVersion
+      summary: Get a specific Hub resource version
+      description: >-
+        Returns one version of a Task, Pipeline, or StepAction, including its
+        available versions, README, manifest, and raw-manifest URL. The version
+        can use the original catalog value or its semantic-version-normalized
+        equivalent. A catalog that is not visible from the Namespace is
+        reported as `404`. This operation requires `get` permission on
+        `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Catalog'
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/Name'
+        - $ref: '#/components/parameters/Version'
+        - $ref: '#/components/parameters/Namespace'
+      responses:
+        '200':
+          $ref: '#/components/responses/HubResource'
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+  /v1/resource/{catalog}/{kind}/{name}/{version}/yaml:
+    get:
+      tags:
+        - Hub Resources
+      operationId: getHubResourceManifest
+      summary: Get a raw Hub resource manifest
+      description: >-
+        Returns the raw Tekton YAML referenced by `spec.manifestURL` in Hub
+        resource responses. A catalog that is not visible from the Namespace is
+        reported as `404`. This operation requires `get` permission on
+        `hub.tekton.dev/resources`.
+      security:
+        - bearerAuth: []
+      parameters:
+        - $ref: '#/components/parameters/Catalog'
+        - $ref: '#/components/parameters/Kind'
+        - $ref: '#/components/parameters/Name'
+        - $ref: '#/components/parameters/Version'
+        - $ref: '#/components/parameters/Namespace'
+      responses:
+        '200':
+          description: The raw Tekton resource manifest.
+          content:
+            application/x-yaml:
+              schema:
+                type: string
+              example: |-
+                apiVersion: tekton.dev/v1
+                kind: Task
+                metadata:
+                  name: run-script
+        '400':
+          $ref: '#/components/responses/BadRequest'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          $ref: '#/components/responses/Forbidden'
+        '404':
+          $ref: '#/components/responses/NotFound'
+        '500':
+          $ref: '#/components/responses/InternalServerError'
+        '503':
+          $ref: '#/components/responses/ServiceUnavailable'
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: Kubernetes or ACP access token
+      description: >-
+        Send the current user's token in the `Authorization: Bearer <token>`
+        header. Namespace-aware requests never fall back to an unscoped query.
+  parameters:
+    Namespace:
+      name: namespace
+      in: query
+      required: false
+      description: >-
+        Workspace Namespace used for authorization and catalog visibility
+        filtering. It must be a DNS-1123 label. When omitted, the response uses
+        the legacy unscoped catalog view. Generated `apiPath` and `manifestURL`
+        values preserve this parameter.
+      schema:
+        type: string
+        maxLength: 63
+        pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
+      example: team-a
+    IncludeContent:
+      name: includeContent
+      in: query
+      required: false
+      description: >-
+        Whether list items include README and manifest content. Detail and batch
+        responses always include content.
+      schema:
+        type: boolean
+        default: true
+    Offset:
+      name: offset
+      in: query
+      required: false
+      description: Zero-based offset applied after visibility filtering.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+        default: 0
+    Limit:
+      name: limit
+      in: query
+      required: false
+      description: >-
+        Maximum number of items to return. When supplied, the server caps it at
+        `config.maxBatchQuerySize`, which defaults to 200. When omitted, all
+        items after `offset` are returned.
+      schema:
+        type: integer
+        format: int32
+        minimum: 0
+      example: 20
+    Catalog:
+      name: catalog
+      in: path
+      required: true
+      description: Repository or catalog name.
+      schema:
+        type: string
+        minLength: 1
+      example: alauda
+    Kind:
+      name: kind
+      in: path
+      required: true
+      description: Tekton resource kind.
+      schema:
+        $ref: '#/components/schemas/HubResourceKind'
+    Name:
+      name: name
+      in: path
+      required: true
+      description: Hub resource name.
+      schema:
+        type: string
+        minLength: 1
+      example: run-script
+    Version:
+      name: version
+      in: path
+      required: true
+      description: Original or semantic-version-normalized resource version.
+      schema:
+        type: string
+        minLength: 1
+      example: 0.1.0
+  requestBodies:
+    TaskBatchRequest:
+      description: Metadata for the Tasks to retrieve.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HubResourceBatchRequest'
+          example:
+            - catalog: alauda
+              kind: task
+              name: run-script
+              version: '0.1'
+    PipelineBatchRequest:
+      description: Metadata for the Pipelines to retrieve.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HubResourceBatchRequest'
+          example:
+            - catalog: alauda
+              kind: pipeline
+              name: build-and-push
+              version: '0.1'
+    StepActionBatchRequest:
+      description: Metadata for the StepActions to retrieve.
+      required: true
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HubResourceBatchRequest'
+          example:
+            - catalog: alauda
+              kind: stepaction
+              name: git-clone
+              version: '0.1'
+  responses:
+    HubResourceList:
+      description: The requested Hub resources.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HubResourceList'
+    HubResource:
+      description: The requested Hub resource.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/HubResource'
+          example:
+            metadata:
+              name: run-script
+              uid: 3248f13064a355a7ec3d3b46d4f958ca
+              labels:
+                hub.tekton.dev/catalog: alauda
+                hub.tekton.dev/catalog-type: artifact-hub
+              annotations:
+                hub.tekton.dev/displayName: Run Script
+                hub.tekton.dev/description: Run a custom shell script.
+            spec:
+              version: '0.1'
+              available_versions:
+                - '0.1'
+              apiPath: alauda/task/run-script?namespace=team-a
+              tags:
+                - shell
+              readme: '# Run Script'
+              platforms:
+                - linux/amd64
+              manifest: |-
+                apiVersion: tekton.dev/v1
+                kind: Task
+                metadata:
+                  name: run-script
+              manifestURL: /v1/resource/alauda/task/run-script/0.1.0/yaml?namespace=team-a
+              description: Run a custom shell script.
+              raw: {}
+    BadRequest:
+      description: The Namespace, query parameter, path, or request body is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: invalid namespace
+    Unauthorized:
+      description: The Authorization header is missing or the Bearer token is invalid.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: missing authorization header
+    Forbidden:
+      description: The authenticated caller is not allowed to access Hub resources in the Namespace.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: forbidden
+    NotFound:
+      description: >-
+        The Namespace or resource does not exist, or the catalog is not visible
+        from the Namespace. Hidden catalogs intentionally use the same status as
+        missing resources.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: resource not found
+    PayloadTooLarge:
+      description: The batch request body exceeds 1 MiB.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: request body exceeds 1048576 bytes
+    InternalServerError:
+      description: Indexed README or manifest content could not be resolved.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: resolve resource content
+    ServiceUnavailable:
+      description: >-
+        The Hub index, authentication service, or Namespace lookup service is
+        temporarily unavailable.
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/ErrorResponse'
+          example:
+            error: namespace authorization unavailable
+  schemas:
+    HubResourceKind:
+      type: string
+      enum:
+        - task
+        - pipeline
+        - stepaction
+      example: task
+    HubResourceLookup:
+      type: object
+      additionalProperties: false
+      required:
+        - catalog
+        - name
+      properties:
+        catalog:
+          type: string
+          minLength: 1
+          description: Repository or catalog name.
+        kind:
+          allOf:
+            - $ref: '#/components/schemas/HubResourceKind'
+          description: >-
+            Optional resource kind. When omitted, it defaults to the collection
+            endpoint kind; when present, it must match that endpoint.
+        name:
+          type: string
+          minLength: 1
+          description: Hub resource name.
+        version:
+          type: string
+          description: Optional version. When omitted, the latest version is returned.
+    HubResourceBatchRequest:
+      type: array
+      maxItems: 200
+      description: >-
+        Batch lookup entries. The configured maximum can differ from the
+        documented default of 200.
+      items:
+        $ref: '#/components/schemas/HubResourceLookup'
+    HubResourceList:
+      type: object
+      required:
+        - items
+      properties:
+        metadata:
+          $ref: '#/components/schemas/ListMetadata'
+        items:
+          type: array
+          items:
+            $ref: '#/components/schemas/HubResource'
+    ListMetadata:
+      type: object
+      properties:
+        resourceVersion:
+          type: string
+          description: Reserved for Kubernetes list compatibility; normally empty.
+    HubResource:
+      type: object
+      required:
+        - spec
+      properties:
+        metadata:
+          $ref: '#/components/schemas/ObjectMetadata'
+        spec:
+          $ref: '#/components/schemas/HubResourceSpec'
+    ObjectMetadata:
+      type: object
+      properties:
+        name:
+          type: string
+          description: Hub resource name.
+        uid:
+          type: string
+          description: Deterministic Artifact Hub Shim identifier.
+        labels:
+          type: object
+          additionalProperties:
+            type: string
+        annotations:
+          type: object
+          additionalProperties:
+            type: string
+    HubResourceSpec:
+      type: object
+      required:
+        - version
+        - available_versions
+        - apiPath
+        - tags
+        - readme
+        - platforms
+        - manifest
+        - manifestURL
+        - description
+        - raw
+      properties:
+        version:
+          type: string
+          description: Selected original catalog version.
+        available_versions:
+          type: array
+          description: Original catalog versions sorted from oldest to newest.
+          items:
+            type: string
+        apiPath:
+          type: string
+          description: Versionless resource-detail path relative to `/api/v1alpha1/`.
+        tags:
+          type: array
+          items:
+            type: string
+        readme:
+          type: string
+          description: README Markdown. Empty when `includeContent=false` on a list request.
+        platforms:
+          type: array
+          items:
+            type: string
+        manifest:
+          type: string
+          description: Raw Tekton YAML. Empty when `includeContent=false` on a list request.
+        manifestURL:
+          type: string
+          description: Path to the raw YAML endpoint for the selected version.
+        description:
+          type: string
+          description: Human-readable resource description.
+        raw:
+          type: object
+          additionalProperties: true
+          description: Reserved compatibility field for additional resource data.
+    ErrorResponse:
+      type: object
+      required:
+        - error
+      properties:
+        error:
+          type: string
+          description: Human-readable error message.

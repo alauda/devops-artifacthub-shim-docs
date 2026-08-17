@@ -1,0 +1,185 @@
+---
+weight: 50
+title: Installation Guide
+queries:
+  - How do I install Artifact Hub Shim on ACP?
+  - Which Artifact Hub Shim installation settings should I use?
+  - How do I uninstall Artifact Hub Shim safely?
+---
+
+# Installation Guide
+
+This guide installs Artifact Hub Shim as an ACP cluster plugin. The standard
+installation is completely offline and deploys the API, built-in catalog, and
+template-render extension into `artifacthub-shim-system`.
+
+## Prerequisites
+
+- You have ACP platform-administrator permissions and access to cluster plugin
+  management.
+- You have installed the `violet` CLI on an operation host that can access the
+  ACP platform.
+- You have downloaded the Artifact Hub Shim cluster plugin package to the
+  operation host.
+- `Alauda DevOps Pipelines` v4.0 or later is installed if the cluster will
+  consume catalog resources through Tekton or Pipelines as Code.
+- You can use `kubectl` with cluster-administrator permissions to verify the
+  installation.
+
+If the cluster already has a Tekton Hub or another Artifact Hub endpoint,
+record its configuration before changing consumers to Artifact Hub Shim.
+
+## Upload the Cluster Plugin with Violet
+
+Using `violet push` is the recommended way to upload the cluster plugin. The
+command transfers the packaged OCI chart and related images to the ACP global
+registry and creates or updates the `ModulePlugin` resource included in the
+package.
+
+Run the following command from the directory containing the plugin package:
+
+```bash
+violet push <plugin-package>.tgz \
+  --platform-address <platform-address> \
+  --platform-username <platform-username> \
+  --platform-password <platform-password> \
+  --clusters <cluster-name> \
+  --force
+```
+
+Replace the placeholders as follows:
+
+| Argument or Placeholder | Description |
+| --- | --- |
+| `<plugin-package>.tgz` | Artifact Hub Shim cluster plugin package supplied for the target architecture. |
+| `<platform-address>` | ACP platform URL. |
+| `<platform-username>` | Platform administrator username. |
+| `<platform-password>` | Password for the platform administrator account. |
+| `<cluster-name>` | Cluster where the plugin version must be available. Use a comma-separated list for multiple clusters. |
+| `--force` | Overwrites existing artifacts and fixed-tag images in the registry so that the uploaded package content takes effect. |
+
+Do not put platform credentials in scripts or source control. After the command
+completes, open **Platform Management** > **Marketplace Management** >
+**Cluster Plugins** and verify that **Alauda Artifact Hub Shim** is listed with
+the uploaded version.
+
+## Install the Cluster Plugin from the Web Console
+
+Use the following values for a standard initial installation:
+
+| Setting | Recommended Value | Purpose |
+| --- | --- | --- |
+| Install Namespace | `artifacthub-shim-system` | Uses the standard Service names expected by Pipelines integration. |
+| Replica Count | `1` | Uses the default single-replica topology. |
+| ACP Global Cluster Mode | Disabled | Enable only when the workload runs on the ACP global cluster. |
+| Enable Built-in Catalog | Enabled | Makes the packaged Task, Pipeline, and StepAction catalog available. |
+| Install Catalog Extra Resources | Enabled | Synchronizes packaged templates and tool-image ConfigMaps. |
+| Enable Template Render Extension | Enabled | Enables template rendering and resolver visibility admission. |
+| Source Workdir Type | `emptyDir` | Uses pod-local storage and remains compatible with future replica increases. |
+| Enable Content Store | Disabled | Serves manifests from the active in-memory snapshot. |
+| Refresh Interval | `10m` | Refreshes registered Git sources periodically. |
+| Log Level / Format | `info` / `json` | Provides production-oriented structured logs. |
+
+For persistent storage, custom authentication, Ingress, and advanced runtime
+settings, see [Chart Configuration](configure/chart_configuration.mdx).
+
+1. Log in to ACP as a platform administrator.
+2. Open the target cluster and navigate to cluster plugin management.
+3. Select **Alauda Artifact Hub Shim**.
+4. Select the latest available version approved for your environment.
+5. Apply the recommended configuration above. If the target is the ACP global
+   cluster, enable **ACP Global Cluster Mode**.
+6. Start the installation and wait until the plugin reports `Running`.
+
+Do not create or edit `ModulePlugin`, `ModuleConfig`, `ModuleInfo`,
+`ClusterPluginInstance`, or the derived `AppRelease` directly for a normal
+installation. ACP manages those resources as part of the cluster plugin
+lifecycle.
+
+## Verify the Installation
+
+The following commands assume the default install namespace, Helm release name,
+and generated resource names. If you customized any of these values, replace
+the namespace and resource names in the commands.
+
+Check that the API Deployment is available:
+
+```bash
+kubectl get deployment -n artifacthub-shim-system
+kubectl rollout status deployment/artifacthub-shim \
+  -n artifacthub-shim-system \
+  --timeout=5m
+```
+
+If you disabled **Enable Template Render Extension** during installation, skip
+the following command. Otherwise, verify the extension Deployment:
+
+```bash
+kubectl rollout status deployment/artifacthub-shim-extension \
+  -n artifacthub-shim-system \
+  --timeout=5m
+```
+
+Check the in-cluster Service and API health without exposing it externally:
+
+```bash
+kubectl get service artifacthub-shim-api -n artifacthub-shim-system
+
+kubectl get --raw \
+  '/api/v1/namespaces/artifacthub-shim-system/services/http:artifacthub-shim-api:80/proxy/healthz'
+
+kubectl get --raw \
+  '/api/v1/namespaces/artifacthub-shim-system/services/http:artifacthub-shim-api:80/proxy/readyz'
+```
+
+The health request should succeed, and the readiness response should contain
+`"status":"ready"`.
+
+Inspect the active snapshot when you need to verify source loading:
+
+```bash
+kubectl get --raw \
+  '/api/v1/namespaces/artifacthub-shim-system/services/http:artifacthub-shim-api:80/proxy/api/v1/snapshot'
+```
+
+Do not publish the Service externally for Tekton integration. Tekton and
+Pipelines as Code should use the in-cluster Service URL.
+
+## Connect Tekton
+
+After the plugin is ready, configure `TektonConfig` and verify one remote Task.
+Standard installations use this endpoint:
+
+```text
+http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local
+```
+
+Follow [Quick Start](overview/quick_start.mdx) for the minimal validation or
+[Configure Tekton Integration](how_to/configure_tekton_integration.mdx) for
+Tekton and Pipelines as Code settings.
+
+## Customize the Installation
+
+- To add an internal catalog, see
+  [Configure Custom Git Repositories](how_to/configure_custom_git_repositories.mdx).
+- To change storage or authentication, see
+  [Chart Configuration](configure/chart_configuration.mdx).
+- To run multiple API replicas, follow
+  [High Availability](configure/high_availability.mdx) before increasing
+  `replicaCount`.
+- To change log verbosity or encoding, see
+  [Logging](configure/logging.mdx).
+
+## Uninstall Artifact Hub Shim
+
+Uninstalling the plugin removes the local endpoint used by Tekton resolver,
+Pipelines as Code, and the DevOps Hub UI. It can interrupt pipelines and remove
+plugin-managed resources. Use the deletion risk information displayed by ACP
+cluster plugin management and follow your organization's approved uninstall
+procedure.
+
+Before uninstalling, reconfigure or disable every consumer that points to the
+Artifact Hub Shim Service, back up user-managed repository definitions and
+credentials through an approved secure process, and ensure that no active
+PipelineRun or TaskRun depends on the endpoint. Never store exported
+credentials in source control.

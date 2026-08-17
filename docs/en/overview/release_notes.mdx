@@ -1,0 +1,70 @@
+---
+weight: 60
+title: Release Notes
+queries:
+  - What is included in Artifact Hub Shim v1.0.0?
+  - What changed in the first GA release of Artifact Hub Shim?
+  - Are there known issues in Artifact Hub Shim v1.0.0?
+---
+
+# Release Notes
+
+## Integration Requirements
+
+Artifact Hub Shim is installed as an ACP cluster plugin. Tekton resolver and
+Pipelines as Code integration require `Alauda DevOps Pipelines` v4.0 or later.
+
+## v1.0.0
+
+Released on August 17, 2026, v1.0.0 is the first generally available release of
+Artifact Hub Shim.
+
+### Features and Enhancements
+
+**Offline Catalog Service**
+
+- Provides an Artifact Hub-compatible API for Tekton `Task`, `Pipeline`, and
+  `StepAction` resources without requiring internet access.
+- Packages the built-in ACP catalog and its referenced tool images for offline
+  plugin delivery.
+- Supports original and normalized semantic versions, latest-version selection,
+  catalog aliases, disabled packages, and source-conflict isolation.
+
+**Custom Catalog Sources**
+
+- Loads additional catalogs from Git repositories declared through labeled
+  Kubernetes `ConfigMap` resources.
+- Supports HTTPS credentials, SSH credentials, private CA certificates,
+  cross-namespace source discovery, optional sources, and last-valid snapshot
+  behavior when a refresh fails.
+
+**Tekton and DevOps Integration**
+
+- Serves the Artifact Hub endpoints used by the Tekton hub resolver and
+  Pipelines as Code.
+- Serves authenticated Hub-compatible APIs used by the ACP DevOps UI.
+- Supports global, project, namespace, and explicit-namespace repository
+  visibility, including local resolver admission checks.
+
+**Catalog Extensions**
+
+- Synchronizes explicitly labeled extra `ConfigMap` resources into approved
+  namespaces with ownership, conflict, prune, and keep-policy controls.
+- Provides an optional webhook for catalog mail and execution-overview template
+  rendering.
+
+**Operations and Security**
+
+- Provides health, readiness, and per-source snapshot-status endpoints.
+- Supports IPv4, IPv6, dual-stack, restricted Pod Security defaults, and
+  multi-replica API deployment with pod-local storage.
+- Integrates UI-compatible endpoints with ACP or Kubernetes request
+  authentication and SubjectAccessReview authorization.
+
+### Fixed Issues
+
+{/* release-notes-for-bugs?template=fixed&project=DEVOPS&version=v1.0.0 */}
+
+### Known Issues
+
+{/* release-notes-for-bugs?template=unfixed&project=DEVOPS&version=v1.0.0 */}

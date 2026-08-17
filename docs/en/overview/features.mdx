@@ -1,0 +1,84 @@
+---
+weight: 30
+queries:
+  - What features does Artifact Hub Shim provide?
+  - Can Artifact Hub Shim serve custom Git catalogs?
+  - Does Artifact Hub Shim support Tasks Pipelines and StepActions?
+---
+
+# Feature Overview
+
+## Catalog Delivery
+
+- **Built-in offline catalog**
+
+  Deliver ACP-provided `Task`, `Pipeline`, and `StepAction` resources together
+  with the cluster plugin. No runtime access to a public catalog is required.
+
+- **Git-backed custom catalogs**
+
+  Register one or more internal Git repositories through Kubernetes
+  `ConfigMap` resources. HTTPS tokens, SSH keys, private certificate authorities,
+  optional sources, and independent source-status reporting are supported.
+
+- **Version-aware indexing**
+
+  Resolve original or normalized semantic versions, list available versions,
+  select the latest version, and disable selected packages or versions.
+
+## Tekton and ACP Integration
+
+- **Tekton hub resolver compatibility**
+
+  Resolve catalog resources with standard Tekton `resolver: hub` references.
+
+- **Pipelines as Code compatibility**
+
+  Use the same in-cluster catalog endpoint for Pipelines as Code remote Task
+  references.
+
+- **DevOps Hub UI compatibility**
+
+  Browse Task, Pipeline, and StepAction metadata, README content, versions, and
+  manifests through ACP-authenticated APIs.
+
+## Catalog Administration
+
+- **Scoped repository visibility**
+
+  Expose a custom repository globally, to one namespace, to namespaces in the
+  same ACP project, or to an explicit namespace allowlist.
+
+- **Extra-resource synchronization**
+
+  Synchronize approved catalog `ConfigMap` resources into allowed namespaces
+  with ownership, conflict, prune, and keep-policy controls.
+
+- **Template rendering**
+
+  Render catalog-provided mail or execution-overview templates for TaskRuns by
+  using the optional admission extension.
+
+## Operations
+
+- **Health and source status**
+
+  Use `/healthz`, `/readyz`, and `/api/v1/snapshot` to inspect process health,
+  snapshot readiness, and source-level synchronization errors.
+
+- **High availability**
+
+  Run multiple API replicas with independent pod-local snapshots. Leader
+  election ensures that only one replica synchronizes extra resources.
+
+- **Restricted Pod Security compatibility**
+
+  Default pod and container security contexts use a non-root identity, a
+  read-only root filesystem, RuntimeDefault seccomp, and no Linux capabilities.
+
+- **IPv4, IPv6, and dual-stack delivery**
+
+  The plugin images and integration paths support ACP clusters using IPv4,
+  IPv6, or dual-stack networking.
+
+For stability commitments, see [Feature Maturity](./feature_maturity.mdx).

@@ -11,7 +11,7 @@ category: howto
 Hub-compatible APIs. Tekton hub resolver and Pipelines as Code should use the
 in-cluster shim Service, not public `artifacthub.io` or `api.hub.tekton.dev`.
 
-Standard ACP DevOps 4.13 installations use these defaults:
+Standard ACP DevOps 4.14 installations use these defaults:
 
 | Setting | Value |
 | --- | --- |
@@ -24,7 +24,7 @@ Standard ACP DevOps 4.13 installations use these defaults:
 
 ## Tekton Hub Resolver
 
-When the plugin uses the standard namespace and release name, ACP DevOps 4.13
+When the plugin uses the standard namespace and release name, ACP DevOps 4.14
 sets the resolver defaults during component installation. For custom
 installations, merge this configuration into `TektonConfig.spec.pipeline`:
 
@@ -76,6 +76,6 @@ The shim API itself does not register `/hub/**` handlers.
 
 ## Related Content
 
-- [Quick Start](../quick_start.mdx)
+- [Quick Start](../overview/quick_start.mdx)
 - [Consume Resources with the Hub Resolver](consume_resources_with_hub_resolver.mdx)
 - [Historical Pipeline Catalog References](../trouble_shooting/historical_pipeline_catalog.mdx)

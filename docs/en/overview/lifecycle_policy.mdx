@@ -1,0 +1,42 @@
+---
+weight: 50
+queries:
+  - Which Artifact Hub Shim versions are supported?
+  - How are Artifact Hub Shim bugs and vulnerabilities fixed?
+---
+
+# Lifecycle Policy
+
+## Released Versions
+
+| Version | Release Date | Support Status |
+| --- | --- | --- |
+| v1.0.0 | August 17, 2026 | Supported until a newer version is released |
+
+## Release Policy
+
+Artifact Hub Shim follows a rolling-release maintenance model. Development and
+maintenance occur on the main product line, and each new release supersedes the
+previous release.
+
+No fixed end-of-support date is assigned in advance. The latest released
+version is the supported version. When a newer version becomes available, the
+previous version stops receiving maintenance and users should upgrade to the
+latest version.
+
+## Maintenance Policy
+
+Bug fixes, security updates, and compatibility improvements are delivered in a
+new release from the current product line. Alauda does not publish maintenance
+patches for older Artifact Hub Shim versions after a newer version has been
+released.
+
+When an issue affects an older installation:
+
+1. Review the latest [Release Notes](./release_notes.mdx) for behavioral or
+   configuration changes.
+2. Back up custom repository definitions and plugin configuration.
+3. Upgrade the cluster plugin to the latest available version.
+4. Verify API readiness, source status, and Tekton resolution after the upgrade.
+
+Artifact Hub Shim v1.0.0 is the first generally available release.

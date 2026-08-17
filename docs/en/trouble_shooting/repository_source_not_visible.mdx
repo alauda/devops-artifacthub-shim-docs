@@ -30,10 +30,11 @@ The usual causes are:
 1. The ConfigMap is not watched by `artifacthub-shim`.
 2. `repository.yaml` is missing or invalid.
 3. Another source uses the same repository name.
-4. The referenced Secret is missing or contains unsupported credential keys.
-5. Git clone or fetch fails.
-6. The catalog directory layout is invalid.
-7. The package or version is disabled.
+4. The request uses a legacy catalog alias that was disabled by a conflict.
+5. The referenced Secret is missing or contains unsupported credential keys.
+6. Git clone or fetch fails.
+7. The catalog directory layout is invalid.
+8. The package or version is disabled.
 
 `artifacthub-shim` isolates source failures across ConfigMaps. If one entry in
 a ConfigMap is invalid, all repository entries in that ConfigMap are rejected,
@@ -88,6 +89,20 @@ data:
 If the label is missing or has a value other than `"true"`, the ConfigMap is
 ignored.
 
+For repository ConfigMaps outside the primary watched namespace, also verify:
+
+- `config.scopedConfigMapSources.enabled` is `true` for namespace, project, or
+  explicit Namespace allowlist scopes.
+- `config.globalConfigMapSources.enabled` is `true` for
+  `repository-visibility: "global"`, and the source Namespace is included in
+  `config.globalConfigMapSources.allowedNamespaces` when that list is non-empty.
+- Project scope owner Namespaces have a non-empty `cpaas.io/project` label.
+- At least one valid Namespace listed by
+  `artifacthub-shim.alauda.io/repository-visible-namespaces` exists. Missing
+  entries are ignored until the Namespace is created.
+- The artifacthub-shim ServiceAccount has chart-rendered cluster-wide read RBAC
+  for repository ConfigMaps, Namespaces, referenced Secrets, and Events.
+
 ### 3. Inspect repository ConfigMap Events
 
 Check recent Events on the repository ConfigMap:
@@ -124,6 +139,13 @@ Common Event reasons:
 | `RepositorySourceReady` | A repository source was indexed and is visible. |
 | `RepositorySourceInvalid` | A repository source did not enter the current snapshot. |
 | `RepositorySourceDegraded` | A repository source failed this refresh but still serves its previous successful shard. |
+| `RepositoryScopeInvalid` | The visibility label or scoped-source policy is invalid. |
+| `GlobalRegistrationDenied` | A non-primary Namespace attempted global registration while the feature is disabled. |
+| `GlobalNamespaceNotAllowed` | The source Namespace is outside the configured global registration allowlist. |
+| `ProjectNotFound` | A project-scoped source owner has no usable `cpaas.io/project` label. |
+| `VisibleNamespacesInvalid` | The explicit Namespace allowlist is empty, contains an invalid name, or has no existing Namespace. |
+| `VisibleNamespacesPartiallyAccepted` | Missing Namespace entries were ignored while the remaining existing entries stayed active. |
+| `RepositoryNameConflict` | Another deterministic source won the cluster-wide catalog name conflict. |
 
 Common reason message patterns:
 
@@ -136,32 +158,62 @@ Common reason message patterns:
 | `unsupported kind` | `kind` is not `task`, `pipeline`, or `stepaction`. |
 | `path must be relative` | `path` is absolute. |
 | `path must not escape repository root` | `path` uses `..` to leave the repository root. |
-| `duplicate repository name` | More than one source declares the same repository name. |
+| `duplicate repository name` | Several sources share the same case-insensitive repository name. One deterministic winner remains indexed and the other sources are rejected. |
+| `duplicate repository name superseded by higher-priority source ...` | Another source with the same repository name has higher priority (built-in catalog, or a ConfigMap in the install namespace), so this lower-priority source is rejected while the winner stays indexed. |
+| `legacy catalog alias ... conflicts with a canonical repository name ... and was disabled` | A `legacyCatalogAliases[]` value matches an existing repository `name` for the same kind. The alias is disabled while the canonical source remains available. |
+| `legacy catalog alias ... resolves to multiple repositories ... and was disabled` | Two sources declare the same legacy alias for the same kind. The alias is disabled while both canonical sources remain available. |
 | `secret ... not found` | `credentialRef.name` points to a missing Secret. |
 | `no Tekton manifest found` | The package version directory does not contain a valid manifest. |
 | `multiple Tekton manifest candidates` | The version directory has more than one fallback manifest candidate. |
 
 ### 4. Validate repository name uniqueness
 
-Repository names are global catalog identifiers. Two repository entries cannot
-share the same `repository.yaml.gitRepositories[].repositories[].name`, even if
-they are in different ConfigMaps or point to different Git URLs.
+Repository names are global catalog identifiers. When more than one source
+declares the same `repository.yaml.gitRepositories[].repositories[].name`, the
+conflict is resolved by source priority (highest to lowest):
+
+1. The built-in default catalog shipped with artifacthub-shim.
+2. ConfigMap sources registered in the install namespace
+   (`artifacthub-shim-system` by default).
+3. ConfigMap sources registered in any other Namespace.
+
+The highest-priority source wins and stays indexed; lower-priority duplicates
+are marked `Invalid`. When multiple sources share the same priority, the winner
+is the lexically first `namespace/configmap/kind/repository` identity. This
+keeps takeover deterministic and lets the next valid source take over after the
+winner is deleted.
 
 Find all repository ConfigMaps:
 
 ```bash
-kubectl get configmap -n artifacthub-shim-system \
+kubectl get configmap --all-namespaces \
   -l artifacthub-shim.alauda.io/repository=true \
   -o yaml
 ```
 
-If two entries use the same `name`, rename one of them and update any hub
-resolver references that use the old catalog name.
+If two entries at the same priority use the same `name`, rename one of them and
+update any hub resolver references that use the old catalog name.
 
-### 5. Check Secret keys
+### 5. Validate optional paths and legacy aliases
+
+If a migrated source has `optional: true`, a missing or empty `path` is not a
+failure. The source is reported as `Ready` with `packages=0` and `versions=0`.
+This is expected for generated entries such as a Pipeline source in a legacy
+catalog that only contained Tasks.
+
+If `optional` is omitted or set to `false`, a missing `path` remains invalid.
+Use `optional: true` only for intentional migration compatibility, not to hide
+unexpected layout errors.
+
+Check `legacyCatalogAliases` only when you need to keep old resolver `catalog`
+values working. Aliases are scoped by `kind`. Conflicting aliases are omitted
+from lookup and reported as non-fatal warnings; use the canonical repository
+names until the conflict is removed.
+
+### 6. Check Secret keys
 
 If a `repository.yaml.gitRepositories[]` entry uses `credentialRef`, verify the
-Secret exists in the same watched namespace:
+Secret exists in the same namespace as the repository ConfigMap:
 
 ```bash
 kubectl get secret <secret-name> -n artifacthub-shim-system
@@ -179,7 +231,7 @@ Supported keys are:
 
 Do not place credentials in the ConfigMap.
 
-### 6. Check API pod logs
+### 7. Check API pod logs
 
 ```bash
 kubectl logs -n artifacthub-shim-system \
@@ -190,7 +242,7 @@ kubectl logs -n artifacthub-shim-system \
 Look for Git clone errors, YAML parse errors, manifest identity errors, or
 content size limit errors.
 
-### 7. Check disabled package rules
+### 8. Check disabled package rules
 
 If the source is `Ready` but a specific package is missing, check
 `disabledPackages` in the repository ConfigMap and `config.disabledPackages` in
