@@ -5,59 +5,118 @@ category: howto
 
 # Author Catalog Resources
 
-`artifacthub-shim` indexes Tekton resources from filesystem and Git catalog
-sources. A catalog can contain `Task`, `Pipeline`, and `StepAction` resources.
-Each resource is versioned by directory and exposed through the DevOps Hub UI,
-Artifact Hub-compatible APIs, and Tekton `resolver: hub`.
+`artifacthub-shim` indexes Tekton resources from the configured filesystem and
+Git catalog sources. A catalog can contain `Task`, `Pipeline`, and `StepAction`
+resources. Each resource is versioned by directory and exposed through the
+DevOps Hub UI, Artifact Hub-compatible APIs, and the Tekton `hub` resolver.
 
-## Directory Layout
+If the catalog is stored in Git, configure the source before testing the
+resource. See [Configure Custom Git Repositories](../../how_to/configure_custom_git_repositories.mdx)
+for the required `repository.yaml` structure, catalog paths, repository names,
+visibility, credentials, and `extraResources` settings.
 
-Use this layout for a catalog repository:
+## Catalog Directory Layout
+
+Use the following layout for a catalog repository. The root `README.md` and
+`OWNERS` files are recommended for maintainers; the shim indexes resources
+under the `task/`, `pipeline/`, and `stepaction/` directories.
 
 ```text
 catalog-repo/
+├── README.md
+├── OWNERS
 ├── task/
-│   └── run-script/
+│   └── echo-hello/
 │       └── 0.1/
 │           ├── README.md
-│           └── run-script.yaml
+│           ├── echo-hello.yaml
+│           └── samples/
+│               └── taskrun.yaml
 ├── pipeline/
-│   └── build-deploy/
+│   └── hello-pipeline/
 │       └── 0.1/
 │           ├── README.md
-│           └── build-deploy.yaml
+│           ├── hello-pipeline.yaml
+│           └── samples/
+│               └── pipelinerun.yaml
 ├── stepaction/
 │   └── echo-message/
 │       └── 0.1/
 │           ├── README.md
 │           └── echo-message.yaml
 └── config/
-    ├── overview_template/
-    │   └── run-script-overview-template.yaml
-    └── tool_image/
-        └── run-script-custom-image.yaml
+    ├── images/
+    │   └── echo-hello.yaml
+    └── templates/
+        └── echo-hello-overview.yaml
 ```
 
-Rules:
+Follow these rules:
 
-- The top-level directory is the lowercase resource kind: `task`, `pipeline`, or
-  `stepaction`.
-- A version directory must contain one YAML manifest named after the resource.
-- `metadata.name` must match the package directory name.
-- `metadata.labels["app.kubernetes.io/version"]` should match the version
-  directory.
-- `README.md` is recommended because it is shown in UI detail pages.
-- Optional resource directories such as `config/` can contain ConfigMaps that
-  are synchronized through `extraResources` instead of indexed as catalog
-  packages. Use this for supporting resources such as overview templates and
-  tool image selector options. See
-  [Configure Custom Git Repositories](../../how_to/configure_custom_git_repositories.mdx),
-  [Customize Task Overview with Templates](./customize_task_overview_with_templates.mdx),
-  and [Add Custom Task Images to Selector](./add_custom_task_images_to_selector.mdx).
+- Use the lowercase resource kind as the top-level directory: `task`,
+  `pipeline`, or `stepaction`.
+- Use `<kind>/<name>/<version>/` for every package version. Version directory
+  names should be semantic-version-compatible, such as `0.1`, `0.2`, or
+  `1.0.0`.
+- Store the manifest as `<name>.yaml` or `<name>.yml`. The shim prefers this
+  filename. If it is absent, it can discover the only YAML file in the version
+  directory whose Kubernetes `kind` matches the configured source kind.
+- The manifest `metadata.name` must equal the package directory name, and the
+  manifest `kind` must match the top-level source directory.
+- Do not publish both versions that normalize to the same semantic version,
+  such as `0.1` and `0.1.0`, for the same package. They create an ambiguous
+  resolver lookup.
+- Put a version-specific `README.md` beside the manifest. It is optional for
+  indexing, but is displayed on resource detail pages and should document
+  parameters, workspaces, results, examples, and compatibility.
+- `samples/` and `OWNERS` are optional. They are not indexed as manifests, but
+  are useful for review and user documentation.
+- Keep ordinary repository files outside the resource version directories.
+  `artifacthub-shim` does not require an `artifacthub-repo.yml` file.
 
-## Required Metadata
+The `config/` directory is for supporting ConfigMaps, such as tool image
+options and overview templates. These files are not catalog packages. They are
+imported only when the configured source uses `extraResources` and the
+ConfigMap has the import label described in [Configure Custom Git
+Repositories](../../how_to/configure_custom_git_repositories.mdx).
 
-Every indexed resource should include a description and version metadata:
+## Resource Metadata
+
+The shim requires a valid YAML manifest with `kind` and `metadata.name`, and it
+rejects a resource when those values do not match the configured source and
+package directory. The following metadata is the catalog publication contract:
+
+| Field | Level | Requirement |
+| --- | --- | --- |
+| `metadata.name` | Required | Matches the package directory name. |
+| `metadata.labels["app.kubernetes.io/version"]` | Required for catalog publication | Matches the version directory exactly. |
+| `spec.description` | Required for catalog publication | A concise, useful description shown in the UI and API. |
+| `tekton.dev/pipelines.minVersion` | Required for catalog publication | Minimum upstream Tekton Pipelines version compatible with the resource. |
+| `tekton.dev/displayName` | Recommended | Human-readable name used by the UI. |
+| `tekton.dev/categories` | Recommended | A discoverability category, such as `Build Tools`, `CLI`, `Deployment`, or `Testing`. |
+| `tekton.dev/tags` | Recommended | Comma-separated search tags. |
+| `tekton.dev/platforms` | Recommended | Supported platforms, such as `linux/amd64,linux/arm64`. |
+| `artifacthub.io/license` | Required for Artifact Hub metadata | The resource license, for example `Apache-2.0`. |
+| `artifacthub.io/category` | Required for Artifact Hub metadata | One suitable Artifact Hub category, for example `integration-delivery`. |
+| `artifacthub.io/deprecated` | Conditional | Set to `"true"` when publishing a deprecated version. |
+
+`artifacthub-shim` preserves all manifest labels and annotations in its API
+responses. The current parser only rejects malformed YAML, a missing kind, a
+missing name, or a kind/name mismatch; it does not reject an otherwise valid
+manifest solely because an optional annotation is absent. Nevertheless, keep
+the publication metadata above on every released version so that the resource
+has complete UI, search, compatibility, and Artifact Hub metadata.
+
+Keep any existing `style.tekton.dev/descriptors` annotations unchanged. They
+drive dynamic forms and are not rewritten or generated by the shim. For
+ConfigMaps that must be synchronized into the cluster, use the separate
+`artifacthub-shim.alauda.io/import: "true"` label; do not put that label on a
+Task, Pipeline, or StepAction manifest.
+
+### Complete Task Example
+
+The following manifest belongs at
+`task/echo-hello/0.1/echo-hello.yaml`:
 
 ```yaml
 apiVersion: tekton.dev/v1
@@ -72,33 +131,135 @@ metadata:
     tekton.dev/tags: "echo,demo"
     tekton.dev/displayName: "Echo Hello"
     tekton.dev/platforms: "linux/amd64,linux/arm64"
+    artifacthub.io/license: Apache-2.0
+    artifacthub.io/category: integration-delivery
 spec:
-  description: Simple demonstration Task that echoes a message.
+  description: Echo a greeting and expose it as a Task result.
   params:
     - name: message
+      type: string
       description: Message to echo.
       default: "Hello World"
+  results:
+    - name: greeting
+      description: The message written by the Task.
   steps:
-    - name: echo
+    - name: echo-message
       image: alpine:3.21
       script: |
         #!/usr/bin/env sh
         set -eu
         echo "$(params.message)"
+        printf '%s' "$(params.message)" > "$(results.greeting.path)"
 ```
 
-Keep `ClusterTask` out of new catalog content. Tekton Pipelines v1 uses
-namespaced `Task` resources.
+### Complete Pipeline Example
 
-## Resolver References
+The following manifest belongs at
+`pipeline/hello-pipeline/0.1/hello-pipeline.yaml`:
 
-Use `type: artifact` when resolving resources through `artifacthub-shim`.
+```yaml
+apiVersion: tekton.dev/v1
+kind: Pipeline
+metadata:
+  name: hello-pipeline
+  labels:
+    app.kubernetes.io/version: "0.1"
+  annotations:
+    tekton.dev/pipelines.minVersion: "0.56.0"
+    tekton.dev/categories: "Integration & Delivery"
+    tekton.dev/tags: "demo,pipeline,workflow"
+    tekton.dev/displayName: "Hello Pipeline"
+    tekton.dev/platforms: "linux/amd64,linux/arm64"
+    artifacthub.io/license: Apache-2.0
+    artifacthub.io/category: integration-delivery
+spec:
+  description: Run the echo-hello Task with a configurable greeting.
+  params:
+    - name: greeting
+      type: string
+      description: Greeting passed to the Task.
+      default: "Hello from Pipeline"
+  tasks:
+    - name: say-hello
+      taskRef:
+        name: echo-hello
+      params:
+        - name: message
+          value: "$(params.greeting)"
+```
+
+Use `Task`, `Pipeline`, and `StepAction` resources with the current Tekton API
+version supported by the target platform. Do not add new `ClusterTask`
+resources; namespaced `Task` resources are used with Tekton Pipelines v1.
+
+## Supporting ConfigMaps
+
+Use `config/` with a Git `extraResources` entry when a catalog release must
+install supporting ConfigMaps. Only `apiVersion: v1`, `kind: ConfigMap`
+documents with the import label are synchronized. The target namespace must be
+allowed by `config.extraResourceSync.allowedNamespaces` (the default is
+`kube-public`).
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: echo-hello-tool-image
+  namespace: kube-public
+  labels:
+    artifacthub-shim.alauda.io/import: "true"
+    catalog.tekton.dev/tool-image-echo: "true"
+data:
+  name: Echo image
+  image: registry.example.com/team/echo:1.0
+```
+
+Unlabeled ConfigMaps, non-ConfigMap resources, and unrelated files are skipped.
+If a synchronized ConfigMap must remain after it is removed from Git, add
+`artifacthub-shim.alauda.io/resource-policy: keep` to the in-cluster resource.
+See [Add Custom Task Images to Selector](./add_custom_task_images_to_selector.mdx)
+and [Customize Task Overview with Templates](./customize_task_overview_with_templates.mdx)
+for the labels required by those UI features.
+
+## Initialize and Version a Catalog
+
+Create the initial repository structure with:
+
+```bash
+mkdir my-tekton-catalog
+cd my-tekton-catalog
+git init
+mkdir -p task pipeline stepaction
+touch README.md OWNERS
+mkdir -p task/echo-hello/0.1/samples
+```
+
+Keep multiple versions in separate directories. Use a new version when the
+resource contract or behavior changes, and document breaking changes in the
+version `README.md`. Before publishing a new version, verify that its directory
+name, version label, manifest name, and README all describe the same release.
+
+The root `OWNERS` file is repository metadata for maintainers, for example:
+
+```yaml
+approvers:
+  - catalog-maintainer
+reviewers:
+  - devops-reviewer
+```
+
+## Use Resources with the Hub Resolver
+
+For `artifacthub-shim`, set the resolver type to `artifact`. The `catalog`
+value is the built-in or configured repository name, not the Git repository URL
+or local directory name.
 
 ```yaml
 apiVersion: tekton.dev/v1
 kind: TaskRun
 metadata:
-  name: echo-hello-run
+  name: run-echo-hello
 spec:
   taskRef:
     resolver: hub
@@ -113,9 +274,12 @@ spec:
         value: echo-hello
       - name: version
         value: "0.1"
+  params:
+    - name: message
+      value: "Hello from the catalog"
 ```
 
-Built-in catalog names:
+Built-in repository names are:
 
 | Resource kind | Built-in catalog |
 | --- | --- |
@@ -123,19 +287,78 @@ Built-in catalog names:
 | `pipeline` | `catalog-pipelines` |
 | `stepaction` | `catalog-stepactions` |
 
-The built-in StepAction catalog is registered only when the packaged catalog
-contains a `stepaction/` directory.
+The StepAction repository is registered only when the packaged catalog contains
+a `stepaction/` directory. A custom Git repository uses the nested
+`repositories[].name` value from `repository.yaml` as its `catalog` parameter.
+For example, if the repository is named `team-a-tasks`, use:
 
-For complete resolver syntax, see
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: run-team-a-task
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: type
+        value: artifact
+      - name: catalog
+        value: team-a-tasks
+      - name: kind
+        value: task
+      - name: name
+        value: echo-hello
+      - name: version
+        value: "0.1"
+```
+
+The main resolver parameters are:
+
+| Parameter | Required | Description |
+| --- | --- | --- |
+| `type` | Yes for shim references | Use `artifact`. |
+| `catalog` | Yes for custom repositories | The configured repository name. |
+| `kind` | Yes when the resolver cannot infer it | `task`, `pipeline`, or `stepaction`. |
+| `name` | Yes | The package name. |
+| `version` | No | An exact version or supported version constraint; the latest compatible version is selected when omitted. |
+
+For the complete resolver configuration and troubleshooting guidance, see
 [Consume Resources with the Hub Resolver](../../how_to/consume_resources_with_hub_resolver.mdx).
 
 ## Validation Checklist
 
-- The path follows `<kind>/<name>/<version>/<name>.yaml`.
-- The manifest name and directory name match.
-- The version label matches the version directory.
-- `spec.description` is present and useful.
-- Parameters, workspaces, and results have descriptions.
-- Samples and README examples use `type: artifact`.
-- Additional ConfigMaps that must be synced to the cluster have
-  `artifacthub-shim.alauda.io/import: "true"`.
+Before publishing a catalog, check every resource version:
+
+- [ ] The path follows `<kind>/<name>/<version>/<name>.yaml`.
+- [ ] The manifest kind and `metadata.name` match the source kind and package directory.
+- [ ] `app.kubernetes.io/version` matches the version directory.
+- [ ] `spec.description` is present and useful.
+- [ ] `tekton.dev/pipelines.minVersion` states the minimum compatible upstream Tekton version.
+- [ ] `tekton.dev/displayName`, `tekton.dev/categories`, `tekton.dev/tags`, and `tekton.dev/platforms` are provided when applicable.
+- [ ] `artifacthub.io/license` and `artifacthub.io/category` are present; deprecated versions have `artifacthub.io/deprecated: "true"`.
+- [ ] Parameters, workspaces, results, and examples have descriptions where applicable.
+- [ ] Each version has a README with runnable examples.
+- [ ] Samples and resolver references use `type: artifact`.
+- [ ] ConfigMaps intended for synchronization have `artifacthub-shim.alauda.io/import: "true"` and an allowed namespace.
+- [ ] No package contains normalized version duplicates such as `0.1` and `0.1.0`.
+
+Useful local checks include:
+
+```bash
+# List catalog manifests
+find task pipeline stepaction -type f \( -name '*.yaml' -o -name '*.yml' \) -print
+
+# Validate YAML syntax and Kubernetes object shape
+kubectl apply --dry-run=client -f task/echo-hello/0.1/echo-hello.yaml
+kubectl apply --dry-run=client -f pipeline/hello-pipeline/0.1/hello-pipeline.yaml
+
+# Check the version label and minimum Tekton version annotations
+rg 'app.kubernetes.io/version|tekton.dev/pipelines.minVersion' task pipeline stepaction
+```
+
+After the repository is pushed, configure its Git source and verify that the
+repository ConfigMap reports `RepositoryConfigAccepted` and its source reports
+`RepositorySourceReady` events. The Git source, repository name, credentials,
+visibility, and `extraResources` rules are documented in [Configure Custom Git
+Repositories](../../how_to/configure_custom_git_repositories.mdx).
