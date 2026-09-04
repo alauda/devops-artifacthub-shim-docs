@@ -1,0 +1,3056 @@
+---
+weight: 32
+category: howto
+---
+
+# Constrain Artifact Promotion with Kyverno
+
+## Feature Overview
+
+[Promote Artifacts with Skopeo Copy](./promote_artifacts_with_skopeo_copy.mdx) shows how to
+copy an artifact from one registry to another behind a manual approval step, with the
+production credential kept in a Connector
+([set up there](./promote_artifacts_with_skopeo_copy.mdx#production-connector)) rather than a
+Secret. That page guarantees that **an approval happens** for every run of the template. This
+guide adds a set of [Kyverno](https://kyverno.io/) policies that make the template the **only**
+way to hold the production credential — so the approval step cannot be skipped — and whose
+second job is to **take work off the approver**.
+Everything a careful approver would otherwise verify by hand — is this one of the reviewed
+promotion pipelines, does the copy pull from an approved source and land in an approved
+target under the same name, is the approver list the agreed one — is checked automatically at
+admission, so the approval itself can stay what it should be: a sign-off on intent, not a
+line-by-line inspection.
+
+The second half of the value is **when** the check happens: a request that breaks the
+promotion convention **fails before anything starts**, instead of waiting for a human to
+catch it. One example makes that concrete. Different promotions
+need different approvers, so a template may take its `approvers` as a `PipelineRun`
+parameter — but on its own that lets whoever starts the run choose who approves it, and the
+approval machinery validates the names only late, after the run exists and sits at its
+approval step. That is why the promotion page pins the approvers inside the `Pipeline`.
+[Rule 5](#the-rules) is what makes the run-time form safe: a run that passes unlisted
+approvers is never created, and a template edit that names approvers outside the agreed
+list — as a literal or as the parameter's default — is refused the moment someone tries it.
+
+The recognition does **not** come from the tool: `skopeo-copy` is a general-purpose Task that
+mirrors base images and moves artifacts between test registries, and none of that is a promotion.
+It comes from a convention the promotion page already establishes and this guide makes explicit:
+**the production registry is reachable only through one Connector, and a run that mounts that
+Connector must be one of the promotion pipeline templates.** Everything else that copies images
+is left alone. [What Counts as a Promotion](#what-counts) spells the convention out.
+
+Three Alauda DevOps Connectors terms carry the rest of the page. A **Connector** is a namespaced
+object that holds the credential for one external system — here, the production registry — and
+lends it to workloads without exposing it. A run borrows it through the **`connectors-csi`**
+driver: a `workspace` (or volume) whose `csi.driver` is `connectors-csi` and whose attributes
+name the Connector. An **`AccessPolicy`** is an optional object that can make borrowing a
+Connector conditional on an approval; it is not required by this guide, and
+[Who May Approve](#approval) says when it is worth its cluster-wide cost.
+
+The guardrails are **eleven independent policy objects — one per guardrail — meant to be
+composed**. Nine carry a single rule; two objects carry a pair that drops or tightens as one
+unit — rule 2's (the `TaskRun` rule and the owner-reference rule its Pod-level companion
+depends on) and rule 5's (the run side and the template side of one approver list). Compose freely:
+apply all of them, or only the ones that express constraints your organisation actually has.
+Each is explained and listed on its own in [The Rules](#the-rules), and
+[Composing the Rules](#composing) shows how to operate a chosen subset as one unit.
+
+| # | Rule | What it prevents | |
+| --- | --- | --- | --- |
+| 1 | `promotion-runs-use-a-template` | A run that holds the production credential but is not one of the reviewed promotion templates: an inline `pipelineSpec`, another `Pipeline`, a resolver-based reference, a run in another namespace, the Connector bound to the wrong workspace, or a pod template that redirects where the registry hostname resolves or what the step executes | Core |
+| 2 | `no-taskrun-outside-a-template` | A `TaskRun` created directly with the production credential, bypassing the pipeline and its approval step | Core |
+| 3 | `no-pod-outside-a-template` | Any Pod that mounts the production Connector without having been created by the Tekton controller for a run of a promotion template — a hand-written Pod, a `Deployment`, a `Job`, any other controller's workload, or a Tekton `Task` that declares the volume in its own definition | Core |
+| 4 | `template-changes-by-maintainers-only` | A promotion `Pipeline` being edited — approvers, Task reference or parameters — by anyone who is not its maintainer | Core when templates live in the namespace; not needed for catalog-served ones |
+| 5 | `promotion-approvers` | A run, or a template edit, that names approvers outside the namespace's allowed list | Optional |
+| 6 | `sources-from-approved-registries` | Pulling an unvetted artifact in from an arbitrary registry | Optional |
+| 7 | `targets-in-approved-registries` | Pushing to a registry that is not an approved promotion target | Optional |
+| 8 | `mapping-shape` | Empty or malformed mappings that hide a second copy operation | Optional |
+| 9 | `target-path-matches-source` | An approved promotion turning into a rename | Optional |
+| 10 | `templates-expose-only-reviewed-inputs` | A template edit widening the copy step's input surface: `srcImage`, `dstImages`, the `copy-mappings` workspace, `skopeoImage`, `extraCopyArgs`, any input added later, or an inline `taskSpec` that would hide the copy step from those lists | Optional |
+| 11 | `sources-carry-release-tags` | Promoting a build that is not a release: `latest`, a branch or date tag, or an untagged reference — anything not pinned by digest or tagged in an approved release format | Optional |
+
+"Core" is what makes the convention hold — with rules 1, 2 and 3 absent, nothing ties the
+credential to the reviewed pipelines and every other rule can be bypassed by not being a
+promotion at all. Rules 1 and 2 judge Tekton's runs; rule 3 is the floor under them, judging
+the Pod every request eventually becomes. The optional rules each assume the core and add one constraint; a team that
+does not restrict destination names simply leaves rule 7 out, and a team whose templates come
+from a governed catalog leaves rule 4 out.
+
+Kyverno judges *what the request contains*, not what the Task eventually does with it. The
+[Limits](#limits) section is not optional reading: a policy trusted beyond its actual reach is
+worse than no policy.
+
+## Use Cases
+
+- Lighten manual review: approvers sign off on intent instead of re-checking pipeline
+  identity, sources, targets and paths by hand.
+- Refuse a run that names an approver outside the agreed list at admission, before the run
+  exists — earlier than the approval machinery's own check.
+- Ensure only the reviewed promotion pipelines can hold the production registry credential —
+  no hand-written runs, `TaskRun`s or Pods, and no other workload.
+- Pin promotion sources and destinations to approved registries, and keep an artifact's
+  repository path unchanged on its way to production.
+- Adopt only the constraints your organisation actually has, and tighten further per
+  namespace ([Tightening a Namespace](#namespace-policy)).
+
+## What Counts as a Promotion \{#what-counts}
+
+A policy can only constrain what it can recognise, and a promotion has no intrinsic marker: the
+same `skopeo-copy` Task, with the same parameters, is a promotion when it writes to production
+and a routine mirror when it writes anywhere else. So the recognition has to come from a
+**convention** — something a promotion always has and nothing else can obtain. This guide uses
+the production credential itself:
+
+1. **The production registry credential exists only as a Connector.** Create it as an OCI or
+   Harbor `Connector` — `<production-connector>` below — and do not keep a
+   `kubernetes.io/dockerconfigjson` Secret for the production registry in any pipeline
+   namespace. A run obtains access by mounting the Connector through the `connectors-csi`
+   driver, which makes the mount the one attribute every promotion carries and nothing else can
+   have — and whatever declares that mount, a `PipelineRun`, a `TaskRun` or a bare Pod, is
+   what the policies examine. The Pod never sees the registry password: the mount provides a `.env` file whose
+   `HTTPS_PROXY` points at the Connectors proxy with the run's short-lived token, `skopeo-copy`
+   loads it, and the proxy injects the real credential on the way to the registry. Once that
+   convention holds — no other copy of the credential exists — there is no way to push to
+   production without the mount; [Limits](#limits) says what happens when it does not hold.
+2. **The approval lives in the template.** The promotion `Pipeline` runs its `ApprovalTask`
+   before the copy and names the approvers inside the template; the manual approval gate
+   accepts a response only from those identities. Together with the first convention that is
+   the whole gate: a run can only reach production by mounting the Connector, and — once the
+   rules below hold — only a run of a template can mount it, so nothing reaches production
+   without the template's approval step. Who may approve is therefore decided by the template's
+   list, which rules 4 and 5 protect — see [Who May Approve](#approval), which also describes
+   an optional `AccessPolicy` layer for teams that want the Connector itself to withhold the
+   credential until the approval is recorded.
+3. **Promotion pipelines are fixed templates.** A template is a reviewed `Pipeline` — the one
+   from the promotion page, `promote-artifacts-with-approval`, is the model — that declares a
+   `dst-registry-config` workspace and exposes only `imageMappings` and the TLS switches as
+   run-time inputs; each `PipelineRun` binds the Connector to that workspace. There may be
+   several templates — one per artifact kind, say — and they may live in the promotion
+   namespace or come from a governed catalog; the rules below take a **list** of template
+   names, and rules 1 to 3 have a variant for catalog-resolved references.
+
+Kyverno's job is then narrow and precise: **a request that mounts `<production-connector>` must
+be one of those templates, the templates must not be tampered with, and the inputs the template
+is given must describe a legitimate promotion.** A run that does not mount the Connector is not
+examined at all — under the convention it cannot reach production, so there is nothing to
+constrain.
+
+The promotion page binds Secrets to both workspaces. To adopt the convention, replace the
+**destination** binding in the `PipelineRun` with the Connector — that is the only required
+change; the source side may keep its Secret or use a Connector of its own. The
+Connector may live in the promotion namespace or be shared from another one — a project- or
+cluster-level Connector is referenced as `namespace/name` just the same; which Pods may mount
+it is exactly what rules 1, 2 and 3 decide. This is
+the `spec.workspaces` portion of the `PipelineRun` — the [quick check](#quick-check) carries a
+complete run in exactly this shape, ready to copy:
+
+Replace in this block: `<connector-namespace>`, `<connector-name>`.
+
+```yaml
+  workspaces:
+    - name: src-registry-config
+      secret:
+        secretName: src-registry-config
+    - name: dst-registry-config
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.namespace: <connector-namespace>
+          connector.name: <connector-name>
+          configuration.names: registry-config
+```
+
+Two things follow from routing the copy through the Connector. Admission-time checks cannot
+show them — nothing starts a Pod there; the checks in
+[Check it against a real promotion run](#real-run) do.
+
+- **Destinations are still written with the real registry host.** The proxy is transparent:
+  `imageMappings` names `<approved-target-registry>/team/app:1.2.3` exactly as it would with a
+  Secret, and `<approved-target-registry>` is simply the host of the Connector's
+  `spec.address`. `skopeo-copy` reports the pushed digest as usual, and it equals the source
+  digest.
+- **The copy passes through the proxy on both sides, but only the destination connection is
+  re-signed.** The `.env` sets `HTTPS_PROXY` for every host except `localhost`, so the source
+  pull goes through it as well — yet the proxy substitutes its own certificate only for a
+  `CONNECT` target that matches the Connector's own address, host and port included, and
+  tunnels every other host through untouched. So the destination connection sees a certificate
+  issued by the Connectors CA, while the source connection still sees the source registry's
+  own. The promotion page's template keeps verification on by exposing both CA workspaces as
+  optional and letting each run bind what its hops need: a Connector-backed run binds the
+  Task's `dst-ca-bundle` to the mount, whose `ca.crt` file *is* that CA, and `src-ca-bundle`
+  takes the site's own CA when the source registry uses a private one. Rule 10's
+  `allowedCopyWorkspaces` list already carries both names, so nothing has to be reviewed in to
+  adopt it. Setting `dstTLSVerify` to `"false"` is the fallback for a template that cannot bind
+  the mount. The policies do not constrain the TLS switches; see [Limits](#limits).
+
+The rules recognise both ways of naming a Connector on a `connectors-csi` volume: the
+single-Connector form above (`connector.name`, with `connector.namespace` defaulting to the
+run's namespace) and the multi-Connector form (`connectors: ns-a/name-a,ns-b/name-b`, available
+when the `enable-multi-connector` feature flag is on). They normalise the list the way the
+driver does — whitespace around an entry is trimmed, empty entries are dropped, and a bare
+`name` resolves in the run's namespace — so a padded or unqualified spelling of the production
+Connector is still recognised. A Connector of the same name in another
+namespace is a different Connector and is not matched.
+
+Why not anchor on the Task? Because the Task is shared. A rule that said "every `skopeo-copy`
+must obey promotion rules" would reject legitimate mirroring, and — worse — would be satisfied by
+any copy that avoided the Task, since there is nothing else identifying it as a promotion. The
+Connector has neither problem: it is required for the outcome, and it is not used for anything
+else.
+
+## Where This Fits in a Promotion Pipeline \{#where-this-fits}
+
+Promotion exists to guarantee one thing: **what runs in production is the artifact that was
+tested, unchanged**. Rebuilding per environment forfeits that guarantee — the same source can
+resolve different base layers or dependencies on a later build — which is why a promotion copies
+rather than rebuilds.
+
+Enforcing that guarantee end to end takes three gates. **This guide implements the admission
+side of the middle one**; the approval side of that gate is the template's `ApprovalTask`,
+which the promotion page builds, and [Who May Approve](#approval) pins down who may answer
+it. The other two gates are sketched here so
+the boundary is clear; each is a design of its own and neither is required to adopt the policy
+below.
+
+| Gate | Question it answers | Where it lives |
+| --- | --- | --- |
+| 1 · Release | Is this artifact fit to be promoted at all? | The build pipeline |
+| 2 · Promotion | May *this* copy, from here to there, happen — and who agreed? | **This guide** |
+| 3 · Admission | May this artifact run in the target cluster? | The consuming cluster |
+
+**Gate 1 — evidence at build time.** A promotion decision is only as good as what is known about
+the artifact. The catalog ships the pieces: `syft` produces an SBOM, `trivy-scanner` produces a
+vulnerability verdict, and `cosign` signs images and attaches attestations. Tekton Chains, where it
+is enabled and holds a signing key, records signed build provenance for every run without the
+pipeline having to ask — a platform-level setting, configured once by whoever operates the
+cluster, not something a promotion pipeline turns on. The output of a build then is not an image
+but an image plus a set of statements about it that can be checked later by someone who does not
+trust the pipeline.
+
+Verification does not have to wait for the target cluster. The cheapest place to require
+"only promote what passes" is a **task in the promotion pipeline itself**, before the copy: a
+`cosign` verify step, or a scan verdict, that fails the run when the artifact does not qualify.
+The approval step then approves something that has already been checked. Because the template
+is protected by this policy, such a step cannot be removed by whoever starts the run.
+
+**Gate 3 — verification at the point of use.** Gates 1 and 2 constrain the promotion *path*.
+Neither constrains a workload that obtained its image some other way. Closing that requires the
+consuming cluster to verify the artifact itself — Kyverno can require a valid signature or
+attestation before a Pod is admitted. This is what turns the promotion path from a convention
+into a technical constraint: an image that skipped it does not run. It depends on gate 1 actually
+signing, and on that cluster's Kyverno being able to reach the registry holding the signatures —
+verify that reachability before planning around it, because a policy that cannot read the
+registry fails closed and rejects everything.
+
+**Promote by digest, and bring the signatures along.** A tag can be repointed after it is
+approved; a digest cannot. The parity rule below compares repository paths, so tag-based mappings
+remain usable, but passing `repo@sha256:…` on both sides of a mapping turns "the artifact is
+unchanged" from an assumption into something the policy enforces. `skopeo-copy` already reports
+each destination in `repo@sha256:…` form for that reason.
+
+Signatures and attestations do not travel with the image on their own — they are separate
+objects, stored in the same repository under tags derived from the image digest
+(`sha256-<digest>.sig`, `sha256-<digest>.att`). Promoting them is therefore just more mappings in
+the same `imageMappings` list, and the rules below admit them: the repository path is identical
+on both sides, only the tag differs. Two details make this work in practice:
+
+- Keep the default `multiArch: all`. Copying the whole manifest list preserves the digest, so
+  signatures made against it stay valid at the destination. Selecting a single architecture, or
+  converting the manifest with `dstImageFormat`, produces a different digest — and every
+  signature and attestation keyed to the old one stops matching.
+- The promotion run gets provenance of its own. `skopeo-copy` reports its destinations in the
+  form Tekton Chains consumes, so where Chains is configured with a signing key, the promotion
+  itself is attested — a record of *this copy*, distinct from the build provenance carried over
+  in the mappings above.
+
+
+## Prerequisites
+
+- The promotion pipeline from
+  [Promote Artifacts with Skopeo Copy](./promote_artifacts_with_skopeo_copy.mdx) is in place,
+  with the destination workspace bound to a Connector as shown in
+  [Keep the Production Credential in a Connector](./promote_artifacts_with_skopeo_copy.mdx#production-connector).
+- Alauda DevOps Connectors is installed, and an OCI or Harbor `Connector` for the production
+  registry exists — in the promotion namespace, or shared at project or cluster level. No
+  Connectors feature flag is required; the
+  optional `AccessPolicy` layer in [Who May Approve](#approval) is the only part that needs
+  one.
+- Kyverno is installed and all of its controllers are ready. On ACP it is delivered by the
+  Compliance Management plugin.
+- You can create cluster-scoped `ClusterPolicy` objects — the rules are cluster-scoped
+  because they must apply regardless of who creates the run, and because a Connector can be
+  mounted from any namespace.
+- `kubectl` can reach the cluster that runs Tekton and Kyverno. Every command in this guide runs
+  against that cluster.
+
+Locate the Kyverno installation before checking it — the namespace is an install-time choice,
+not a fixed name:
+
+```bash
+# Kyverno registers its resource webhook under a fixed name; read the namespace from it.
+KYVERNO_NS="$(kubectl get validatingwebhookconfiguration kyverno-resource-validating-webhook-cfg \
+  -o jsonpath='{.webhooks[0].clientConfig.service.namespace}')"
+echo "${KYVERNO_NS:?no Kyverno webhook found - is Kyverno installed?}"
+
+kubectl get pods -n "${KYVERNO_NS}"
+# Expect the admission, background, cleanup and reports controllers Running and Ready.
+```
+
+Ready pods are a precondition, not proof that admission is being served — the dry-run checks
+further down are what actually prove it. Note the direction of failure these policies choose:
+with the fail-closed webhook they declare, an unavailable admission controller does not silently
+stop enforcing, it rejects every matching request, which stops promotions altogether.
+
+## Placeholders to Replace \{#placeholders-to-replace}
+
+Replace **every** occurrence before applying a policy. A stale placeholder does not fail
+loudly: it silently changes which requests are matched, or which registries are trusted.
+
+| Placeholder | Meaning | How to check the value |
+| --- | --- | --- |
+| `<pipeline-namespace>` | The namespace promotion runs are created in — or several: every list and precondition that names it takes one entry per namespace. The templates live there — or, with the catalog variants of rules 1 to 3, are served from the catalog — and a run anywhere else that mounts the Connector is rejected. | `kubectl get pipeline -A`, restricted to where the promotion templates are; with catalog-served templates, the namespace your promotion runs are created in |
+| `<production-connector>` | The production registry Connector as `namespace/name`: `kube-public/prod-harbor` for a cluster-level Connector, `devops-prod/prod-harbor` for a namespace-level one. `kube-public` here is only where the Connector object lives — the product's shared namespace for cluster-level Connectors — and never where promotion workloads run: Kyverno's default resource filters exclude that namespace, so nothing created there is evaluated at all — see [Limits](#limits). | `kubectl get connectors -A` |
+| `<promotion-pipeline>` | The name of a promotion `Pipeline` template, `promote-artifacts-with-approval` on the promotion page. Every list it appears in accepts several entries — add one line per template, and keep the lists identical across the rules you deploy. | `kubectl get pipeline -n <pipeline-namespace>` |
+| `<approved-source-registry>` | A host artifacts may be promoted **from** — with its port when the registry listens on one: `dev-registry.example.com`, `registry.example.com:5000`. Rule 6 lists approved hosts as wildcard patterns in one condition — add one entry per additional host. | The source host used by your build pipelines |
+| `<approved-target-registry>` | A host artifacts may be promoted **to** — with its port when the registry listens on one, for example `prod-registry.example.com`. Destinations name the registry directly; the Connector proxy is transparent. Rule 7 lists them the same way — one pattern entry per approved host. | The host of the Connector's `spec.address`: `kubectl get connector <connector-name> -n <connector-namespace> -o jsonpath='{.spec.address}'` |
+| `<approved-source-tag-pattern>` | Rule 11 only: a regular expression a source tag must match to count as a release, one entry per pattern. Two are printed under [Rule 11](#rule-11): a strict `v?major.minor.patch` form, which admits `1.2.3` and `v1.2.3` only, and the default, the semver.org grammar with an optional `v` prefix, which also admits `1.2.3-rc.1` and `1.2.3+build.5`; neither admits `latest`, `01.2.3`, `dev-20260902` or branch names (a dotted date such as `2026.10.12` is a valid semantic version and passes the default — require a `v` prefix in your own pattern if that matters). The cosign companion-tag entry stays in the list with either. Digest-pinned sources are accepted without a tag. | Your release tagging convention; `skopeo list-tags docker://<registry>/<repository>` shows what a repository carries |
+| `<allowed-approver>` | An identity allowed to approve promotions in the namespace, written the way the `ApprovalTask` expects it: a username, or a group with the `group:` prefix. Add one line per identity. | The `approvers` your template and `AccessPolicy` name — see [Who May Approve](#approval) |
+| `<tekton-controller-identity>` | The identity Tekton creates `TaskRun`s and their Pods with, `system:serviceaccount:<tekton-namespace>:tekton-pipelines-controller`. | `kubectl get deploy -A -l app.kubernetes.io/name=controller,app.kubernetes.io/part-of=tekton-pipelines -o jsonpath='{range .items[*]}system:serviceaccount:{.metadata.namespace}:{.spec.template.spec.serviceAccountName}{"\n"}{end}'` |
+| `<template-maintainer>` | An identity allowed to change the promotion `Pipeline`s. List several entries when a team maintains them. | `kubectl auth whoami` shows the identity of the current credentials |
+| `<catalog-name>` | Catalog variants of rules 1, 2 and 3 only: the catalog trusted to serve promotion templates through the hub resolver. | The `catalog` value in your templates' `taskRef`, `catalog` on the promotion page |
+
+Three notes on reading the table:
+
+- `<connector-namespace>` and `<connector-name>` in the `PipelineRun` examples are the two
+  halves of `<production-connector>`: with `devops-prod/prod-harbor`, the Connector mounts as
+  `connector.namespace: devops-prod` and `connector.name: prod-harbor`.
+- The table lists every string to substitute. An angle-bracket string that is not in the table
+  is notation local to the spot where it appears, and stays as it is: `<tekton-namespace>`
+  sits inside the ready-made value of `<tekton-controller-identity>` (the check command prints
+  the whole identity, nothing to fill in by hand), `<digest>` describes the signature tag
+  pattern `sha256-<digest>.sig`, and the scripts' comments and `jq` expressions use
+  angle-bracket notation of their own.
+- The workspace names `dst-registry-config` and `dst-ca-bundle` are literals, not placeholders,
+  because the promotion templates declare them under those names. If your template names the
+  destination workspace or its CA workspace differently, change the names in
+  `promotion-runs-use-a-template` accordingly.
+
+## The Rules \{#the-rules}
+
+Each rule below is a **complete, standalone policy object**. The YAML blocks are not fragments
+of one large policy: any one of them can be saved and applied on its own. All eleven carry the label
+`app.kubernetes.io/part-of: promotion-guardrails`, which is how
+[Composing the Rules](#composing) operates whatever subset you chose as a unit.
+
+Every object in this guide is a cluster-scoped `ClusterPolicy` — the demo set is the
+platform's baseline. Kyverno also has a namespaced `Policy` kind with the same rule syntax,
+which is how a team tightens the baseline for its own namespace without cluster-wide rights;
+[Tightening a Namespace](#namespace-policy) introduces it and links a worked reference.
+
+Every rule that inspects runs carries the same recognition preamble in its `context`: the
+`connectors-csi` scan described in [What Counts as a Promotion](#what-counts), ending in the
+`mountsProductionConnector` precondition. It is repeated verbatim in each object — the price of
+policies that can be applied independently — so when you change how the Connector is recognised,
+change it in every rule you deploy.
+
+How to prove the deployed set behaves as described — without persisting anything — is a
+single procedure for the whole set, covered in [Applying and Verifying](#applying-and-verifying).
+
+### Rule 1: a run holding the production credential must be a template
+
+`promotion-runs-use-a-template` matches every `PipelineRun` creation on the cluster, but its
+precondition keeps it silent unless a `connectors-csi` volume names `<production-connector>`.
+The rule looks everywhere such a volume can be declared — the workspace bindings, the pod
+templates (`taskRunTemplate`, `taskRunSpecs`), and the `volumes` of any inline `taskSpec` — so
+mounting the Connector as a raw volume instead of a workspace is recognised just the same.
+When one does, the run must be created in `<pipeline-namespace>`, reference one of the
+`templateNames` — by local name in the base rule below, or through the pinned hub-resolver
+form when the templates are served from a catalog ([Templates from a catalog](#rule-1-catalog), after the
+policy) — never an inline `pipelineSpec`, and carry the
+Connector only as the `dst-registry-config` workspace binding: any other workspace, and any pod
+template or inline Task volume naming it, is refused. The one other workspace name it accepts is
+`dst-ca-bundle`, which a Connector-backed run binds to that very same mount so the destination CA
+is the mount's own `ca.crt` — the same files, in the same Pod, of the same reviewed Task, so it
+exposes nothing the credential binding does not. Anything else holding the credential is
+refused before it starts, whatever it intended to do with it.
+
+The workspace check matters because the template's *source* workspace is also a credential
+mount: binding the production Connector there would let the run read production, which a
+promotion never needs.
+
+Two more details close the gaps a reviewer is likely to look for. The rule also refuses a
+`taskRunTemplate.podTemplate` or `taskRunSpecs[].podTemplate` carrying `hostAliases`,
+`dnsConfig`, `dnsPolicy`, `hostNetwork` or `env`. These fields are harmless on their own —
+runs that do not mount the Connector keep full use of them — but combined with the mounted
+credential they change what the run *does* with it: the first four change where the proxy and
+registry hostnames resolve, so a mapping that names the approved target (and passes rules 6
+and 7) can be made to log in — presenting the production credential — at whatever address the
+pod template points the name to; `env` can rewrite `PATH` so that a binary planted in a
+workspace runs in place of `skopeo`, with the credential mounted beside it. It checks those keys
+rather than the presence of a pod template, because Tekton injects its configured default pod
+template (`securityContext` on ACP) into every run before this policy sees it. And every Tekton kind is
+matched as `tekton.dev/v1/...` only, although Tekton serves `v1beta1` alongside `v1`: the webhook
+Kyverno generates for a `v1`-only rule registers `matchPolicy: Equivalent`, so the API server
+converts a `v1beta1` request to `v1` — the top-level `podTemplate` becomes
+`taskRunTemplate.podTemplate`, `taskRunSpecs[].taskPodTemplate` becomes
+`taskRunSpecs[].podTemplate` — before Kyverno sees it, and the rule reads the `v1` field names
+alone. Do not add `v1beta1` to `kinds` "to be safe": that registers the version too, the
+conversion stops, and every renamed field would then have to be read under both spellings by
+hand. To prove the conversion holds on your cluster, submit a `v1beta1` run that mounts the
+Connector as a server dry run: rule 1 refuses it by name.
+
+:::details Complete policy YAML — `promotion-runs-use-a-template` (copy-paste ready)
+
+Replace in this block: `<promotion-pipeline>`, `<production-connector>`, `<pipeline-namespace>`.
+
+```yaml
+# Rule 1: a run that mounts the production registry Connector must be one of the promotion templates.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: promotion-runs-use-a-template
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: promotion-runs-use-a-template
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # The approved promotion templates: add one entry per template.
+        - name: templateNames
+          variable:
+            value:
+              - <promotion-pipeline>
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        # Single-Connector form: connector.name plus an optional connector.namespace.
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        # Multi-Connector form: a comma-separated list of namespace/name references.
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: connectorRefs
+          variable:
+            jmesPath: "[singleRefs, pluralRefs] | [] | [?@ != '']"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains(connectorRefs, '<production-connector>')"
+        - name: pipelineName
+          variable:
+            jmesPath: "request.object.spec.pipelineRef.name || ''"
+            default: ""
+        - name: pipelineResolver
+          variable:
+            jmesPath: "request.object.spec.pipelineRef.resolver || ''"
+            default: ""
+        - name: hasInlineSpec
+          variable:
+            jmesPath: "request.object.spec.pipelineSpec != null"
+        # A plain by-name reference to one of the approved templates. An inline pipelineSpec has
+        # no name and a resolver reference has no local name, so both fail this test.
+        - name: refIsApprovedTemplate
+          variable:
+            jmesPath: "pipelineResolver == '' && contains(templateNames, pipelineName)"
+        # Pod template keys that change where the Connector proxy hostname resolves, or what
+        # the step executes (env can rewrite PATH). Tekton injects its default pod template
+        # (securityContext) before this policy runs, so the check is per key, not "any podTemplate".
+        - name: podTemplateKeys
+          variable:
+            jmesPath: "[keys(request.object.spec.taskRunTemplate.podTemplate || `{}`), (request.object.spec.taskRunSpecs || `[]`)[].podTemplate | [?@ != null] | map(&keys(@), @) | []] | []"
+        - name: networkOverrides
+          variable:
+            jmesPath: "podTemplateKeys[?contains(`[\"hostAliases\", \"dnsConfig\", \"dnsPolicy\", \"hostNetwork\", \"env\"]`, @)]"
+        # The Connector may be bound to two workspaces of the template: dst-registry-config,
+        # the credential, and dst-ca-bundle, where a Connector-backed run binds the same mount
+        # again so the destination CA is the mount's own ca.crt. That second binding is the same
+        # mount, in the same Pod, of the same reviewed Task -- the same files -- so it exposes
+        # nothing dst-registry-config does not already expose. Any other workspace, and any pod
+        # template or inline Task volume, still counts as misbound.
+        - name: misboundAttrs
+          variable:
+            jmesPath: "[(request.object.spec.workspaces || `[]`)[?name!='dst-registry-config' && name!='dst-ca-bundle'], request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | [] | [?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: rawMisboundRefs
+          variable:
+            jmesPath: "[misboundAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"]), misboundAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')] | [] | [?@ != '']"
+        # Normalized exactly like pluralRefs, or a padded or bare spelling on the wrong
+        # workspace would escape the misbound check while the driver still mounts it.
+        - name: misboundRefs
+          variable:
+            jmesPath: "rawMisboundRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          This run mounts the production registry Connector <production-connector>, so it must
+          be a promotion: created in <pipeline-namespace>, referencing an approved promotion
+          template by name — no resolver, no inline pipelineSpec — with no hostAliases/dnsConfig/
+          dnsPolicy/hostNetwork/env in any pod template, and the Connector bound only to the
+          dst-registry-config and dst-ca-bundle workspaces. got namespace={{ request.namespace }}
+          pipelineRef.name={{ pipelineName }} resolver={{ pipelineResolver }}
+          inlineSpec={{ hasInlineSpec }} networkOverrides={{ networkOverrides }}
+          misbound={{ misboundRefs }}.
+        deny:
+          conditions:
+            any:
+              # One entry per namespace promotion runs are created in.
+              - key: "{{ request.namespace }}"
+                operator: AnyNotIn
+                value:
+                  - <pipeline-namespace>
+              - key: "{{ refIsApprovedTemplate }}"
+                operator: Equals
+                value: false
+              # Refused even next to a valid ref: Tekton rejects the combination too, but the
+              # rule does not lean on that webhook being deployed and healthy.
+              - key: "{{ hasInlineSpec }}"
+                operator: Equals
+                value: true
+              - key: "{{ length(networkOverrides) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ contains(misboundRefs, '<production-connector>') }}"
+                operator: Equals
+                value: true
+```
+
+:::
+
+#### Templates from a catalog \{#rule-1-catalog}
+
+When your templates are served by the internal hub from a
+governed catalog rather than created as `Pipeline` objects in the namespace, a run references
+them through the hub resolver — which the base rule refuses, because a resolver reference is not
+a local name. To also accept a
+hub reference — pinned to the trusted catalog, the `pipeline` kind and a name from the same
+`templateNames` list, the `version` parameter deliberately not compared, so whatever version the
+catalog serves under that name is accepted (the catalog bullet under [Limits](#limits) weighs
+that) — edit the collapsed policy above: in the rule's `context` list, replace the single
+`refIsApprovedTemplate` entry with the seven entries below (the six `ref*` variables it needs
+must come first, exactly as ordered). The trust then rests on the catalog's own governance instead
+of rule 4. Two of the entries close the ways a hub reference can be pointed at another hub while
+keeping the approved coordinates: the hub resolver accepts a request-level `url` parameter that
+replaces the cluster-configured hub endpoint, and a `type` parameter that switches it to the
+Tekton Hub endpoint set — with either, the same catalog and name resolve to whatever that other
+hub serves. The variant refuses any `url`, and accepts `type` only when it is omitted or
+`artifact`. Omitting `type` is safe only while the cluster's hub resolver defaults to `artifact`;
+confirm that once, and have every template reference write `type: artifact` if it does not:
+
+```bash
+# The resolvers' ConfigMaps live in the namespace the operator installs Tekton into.
+NS="$(kubectl get tektonconfig config -o jsonpath='{.spec.targetNamespace}')"
+T="$(kubectl get configmap hubresolver-config -n "$NS" -o jsonpath='{.data.default-type}')"
+[ "$T" = artifact ] || { echo "hub resolver default-type is '$T', not artifact"; exit 1; }
+```
+
+What the variant still trusts is the cluster-configured hub endpoint itself: whoever can change
+`hubresolver-config` changes what the pinned names resolve to, so that platform configuration
+is controlled like `ClusterPolicy` — see [Limits](#limits).
+
+Replace in this block: `<catalog-name>`.
+
+```yaml
+        - name: refParams
+          variable:
+            jmesPath: "(request.object.spec.pipelineRef.params || `[]`)"
+        - name: refCatalog
+          variable:
+            jmesPath: "refParams[?name=='catalog'].value | [0] || ''"
+        - name: refKind
+          variable:
+            jmesPath: "refParams[?name=='kind'].value | [0] || ''"
+        - name: refTemplateName
+          variable:
+            jmesPath: "refParams[?name=='name'].value | [0] || ''"
+        # A request-level url replaces the cluster-configured hub endpoint, and a type other than
+        # artifact switches to the Tekton Hub endpoints: the same coordinates would then resolve
+        # on another hub. Refuse url; accept type only omitted or as a single 'artifact'.
+        - name: refUrlCount
+          variable:
+            jmesPath: "length(refParams[?name=='url'])"
+        - name: refTypeIsArtifact
+          variable:
+            jmesPath: "length(refParams[?name=='type']) == `0` || (length(refParams[?name=='type']) == `1` && (refParams[?name=='type'].value | [0]) == 'artifact')"
+        # A by-name reference to an approved template, or a hub-resolver reference to an
+        # approved template in the trusted catalog, on the cluster-configured hub.
+        - name: refIsApprovedTemplate
+          variable:
+            jmesPath: "(pipelineResolver == '' && contains(templateNames, pipelineName)) || (pipelineResolver == 'hub' && refUrlCount == `0` && refTypeIsArtifact && refCatalog == '<catalog-name>' && refKind == 'pipeline' && contains(templateNames, refTemplateName))"
+```
+
+Check the variant the same way as the base rule, with server dry runs: a run whose reference
+carries a `url` parameter, or a `type` other than `artifact`, is refused by name, and the plain
+reference to an approved template is admitted. The same holds over the parent chains of rules 2
+and 3 once [the parent test for rules 2 and 3](#catalog-parent-test) is installed.
+
+### Rule 2: no `TaskRun` outside a template
+
+Tekton creates the `TaskRun`s of a `PipelineRun` itself, as `<tekton-controller-identity>`, and
+labels each with the `PipelineRun` it belongs to. Anyone with permission to create `TaskRun`s
+could instead write one by hand, mount the Connector, and skip the pipeline and its approval
+step. `no-taskrun-outside-a-template` closes that: a `TaskRun` that mounts
+`<production-connector>` — as a workspace, a pod template volume, or a volume of an inline
+`taskSpec` — must come from the Tekton controller, in `<pipeline-namespace>`, and belong to a
+`PipelineRun` that references one of the templates by name.
+
+The last condition is checked against the parent run itself, reached through the `TaskRun`'s
+**controlling `ownerReference`** — not through a label. The rule takes the `PipelineRun` named
+by the `ownerReferences` entry with `controller: true`, looks it up with a Kyverno API call, and
+applies the same test rule 1 applies to a run: a by-name reference to an approved template, no
+resolver, no inline `pipelineSpec`. The owner reference is the parent pointer that rule 2's
+second rule reserves for the Tekton controller, which writes it from the run it is reconciling:
+a hand-written `TaskRun` may carry one, but it is refused unless the controller wrote it. Every
+`tekton.dev/*` label on a child, by contrast, is open to the run's author —
+`taskRunSpecs[].metadata.labels` is copied onto the `TaskRun` first and wins over the
+controller's own values, so a run can carry a `tekton.dev/pipelineRun` label naming *another*
+run, and `tekton.dev/pipeline` is derived from the run's **name** when the pipeline is inline.
+Verified: an inline run named after the template, referencing a `Task` that declares the
+Connector volume in its own definition, sailed past a label check on every object. The lookup is
+made only for `TaskRun`s that mount the Connector — Kyverno loads a context entry when it is
+first used, after the precondition, which was confirmed by pointing the call at a path that does
+not exist and watching ordinary requests stay admitted — so it adds nothing to runs outside the
+convention. The admission controller needs permission to list `PipelineRun`s; on ACP it has it.
+
+An owner reference is only as trustworthy as its writer, and a `TaskRun` written by hand can
+carry one too. That does not matter for the rule above — a hand-written `TaskRun` fails the
+creator check regardless — but it matters for [rule 3](#rule-3), which reaches the parent
+*through* the `TaskRun` of a Pod: a `TaskRun` that mounts nothing itself, references a `Task`
+declaring the Connector volume, and forges an owner reference to a real promotion run would
+hand the controller a Pod whose owner chain looks legitimate. The object therefore carries a
+second rule, `taskrun-owner-references-set-by-the-controller`: in `<pipeline-namespace>`, a
+`TaskRun` that gains a controlling `PipelineRun` owner reference — on creation, or added by an
+update — must be created or updated by the Tekton controller. It has no Connector precondition,
+because it is what makes every `TaskRun`'s owner reference in the namespace mean what it says;
+its cost is a comparison of two short lists on each `TaskRun` request. The comparison is over
+the whole reference — `apiVersion`, `kind`, `name` and `uid` joined — not the `uid` alone, so
+changing any field of a reference that is already there counts as adding one. And because rules
+2 and 3 fetch the parent *by name*, they also require the run they find to carry the `uid` the
+reference names: a reference renamed to another run points nowhere. Removing an owner
+reference is left alone (the garbage collector does that when a run is orphaned), and so are
+the controller's own label and annotation updates.
+
+A `TaskRun` is not the last place a mount can be declared: a Pod written by hand, or produced
+by any controller other than Tekton, never passes through this rule — and a `Task` that
+declares the volume in its own definition surfaces the mount only on the Pod, because the
+`TaskRun` that references it carries no volume. [Rule 3](#rule-3) covers those; deploy the
+two together. Templates served from a catalog need the parent test widened the same way as
+rule 1 — [the parent test for rules 2 and 3](#catalog-parent-test) below serves both.
+
+:::details Complete policy YAML — `no-taskrun-outside-a-template` (copy-paste ready)
+
+Replace in this block: `<promotion-pipeline>`, `<production-connector>`, `<pipeline-namespace>`, `<tekton-controller-identity>`.
+
+```yaml
+# Rule 2: a TaskRun that mounts the Connector must have been created by Tekton for a PipelineRun of a template.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: no-taskrun-outside-a-template
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: no-taskrun-outside-a-template
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+              operations:
+                - CREATE
+      context:
+        # The approved promotion templates: keep this list in step with rules 1 and 3.
+        - name: templateNames
+          variable:
+            value:
+              - <promotion-pipeline>
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: connectorRefs
+          variable:
+            jmesPath: "[singleRefs, pluralRefs] | [] | [?@ != '']"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains(connectorRefs, '<production-connector>')"
+        # The parent PipelineRun, from the controlling ownerReference the Tekton controller
+        # writes on every TaskRun of a run (Kubernetes allows one controller reference per
+        # object). Not the tekton.dev/pipelineRun label: taskRunSpecs[].metadata.labels
+        # overrides it, so a run's author can make the controller stamp any run's name.
+        - name: runName
+          variable:
+            jmesPath: "(request.object.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].name | [0] || ''"
+            default: ""
+        # The uid of that same reference: the parent is looked up by name, and the uid is what
+        # proves the object found under that name is the one the reference points at.
+        - name: runUid
+          variable:
+            jmesPath: "(request.object.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].uid | [0] || ''"
+            default: ""
+        # Read the parent run back. A list query with a name selector returns an empty list --
+        # not an error -- when the reference is missing or names a run that does not exist.
+        - name: parentRuns
+          apiCall:
+            urlPath: "/apis/tekton.dev/v1/namespaces/{{request.namespace}}/pipelineruns?fieldSelector=metadata.name={{runName}}"
+            jmesPath: "items || `[]`"
+        - name: parentRef
+          variable:
+            jmesPath: "parentRuns[0].spec.pipelineRef || `{}`"
+        # The same test rule 1 applies to a run: a by-name reference to an approved template, no
+        # resolver, no inline pipelineSpec. The uid comparison keeps the lookup honest: the run
+        # fetched by name must be the object the owner reference points at, so a reference whose
+        # name was changed to another run resolves to no parent. Catalog-served templates:
+        # replace this entry with the seven under "Catalog-served templates: the parent test for
+        # rules 2 and 3" (under rule 2 in the guide).
+        - name: parentIsApprovedTemplate
+          variable:
+            jmesPath: "length(parentRuns) == `1` && parentRuns[0].metadata.uid == runUid && (parentRef.resolver || '') == '' && contains(templateNames, parentRef.name || '') && parentRuns[0].spec.pipelineSpec == null"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          A TaskRun that mounts the production registry Connector <production-connector> may only
+          be created by the Tekton controller for a PipelineRun in <pipeline-namespace> that references an
+          approved promotion template. got namespace={{ request.namespace }}
+          creator={{ request.userInfo.username }} owner pipelineRun={{ runName }} parentRef={{ parentRef }}.
+        deny:
+          conditions:
+            any:
+              # One entry per namespace promotion runs are created in.
+              - key: "{{ request.namespace }}"
+                operator: AnyNotIn
+                value:
+                  - <pipeline-namespace>
+              - key: "{{ request.userInfo.username }}"
+                operator: NotEquals
+                value: <tekton-controller-identity>
+              - key: "{{ parentIsApprovedTemplate }}"
+                operator: Equals
+                value: false
+    # 2b: a controlling PipelineRun ownerReference on a TaskRun is written by the Tekton
+    # controller, never by a requester. Rule 3 walks a Pod's owner chain and relies on this.
+    - name: taskrun-owner-references-set-by-the-controller
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+              operations:
+                - CREATE
+                - UPDATE
+              # One entry per namespace promotion runs are created in.
+              namespaces:
+                - <pipeline-namespace>
+      context:
+        # The whole reference, not the uid alone: a rename that keeps the uid must count as a
+        # change too, because rules 2 and 3 look the parent up by name. apiVersion, kind, name
+        # and uid are all required fields of an ownerReference, so the join never sees a null.
+        - name: newOwnerRuns
+          variable:
+            jmesPath: "(request.object.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].join('/', [apiVersion, kind, name, uid])"
+        # Empty on CREATE, where there is no old object.
+        - name: oldOwnerRuns
+          variable:
+            jmesPath: "(request.oldObject.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].join('/', [apiVersion, kind, name, uid])"
+        # The controlling PipelineRun references this request adds. Inside a JMESPath filter the
+        # context is the element, so the old list is injected by substitution.
+        - name: addedOwnerRuns
+          variable:
+            jmesPath: "newOwnerRuns[?!contains(`{{ oldOwnerRuns }}`, @)]"
+      preconditions:
+        all:
+          - key: "{{ length(addedOwnerRuns) }}"
+            operator: GreaterThan
+            value: 0
+      validate:
+        failureAction: Enforce
+        # The deny depends on the requester: without this an UPDATE that adds the reference
+        # would be waved through as a pre-existing violation, as in rule 4.
+        allowExistingViolations: false
+        message: >-
+          A TaskRun in <pipeline-namespace> may carry a controlling PipelineRun ownerReference
+          only when the Tekton controller creates it or adds it; rule 3 trusts that reference.
+          got creator={{ request.userInfo.username }} added={{ addedOwnerRuns }}.
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.userInfo.username }}"
+                operator: NotEquals
+                value: <tekton-controller-identity>
+```
+
+:::
+
+#### Catalog-served templates: the parent test for rules 2 and 3 \{#catalog-parent-test}
+
+The `parentIsApprovedTemplate` entry in the policy above — and the same entry in rule 3 —
+accepts only a namespace-local `Pipeline` referenced by name. With the catalog variant of rule 1, a legitimate
+promotion run references its template through the hub resolver, and the parent test in rules 2
+and 3 must accept the same form. In each of the two policies, replace the single
+`parentIsApprovedTemplate` entry with the seven entries below (the six `parentRef*` variables
+it needs must come first, exactly as ordered). The comparison pins the catalog, the `pipeline`
+kind and the template name from the same `templateNames` list — not the `version` parameter,
+which is left uncompared here exactly as in rule 1's variant (the catalog bullet under
+[Limits](#limits) weighs that) — and refuses a request-level `url` or a `type` other than
+`artifact`, as rule 1's variant does and for the same reason.
+
+Replace in this block: `<catalog-name>`.
+
+```yaml
+        - name: parentRefParams
+          variable:
+            jmesPath: "(parentRef.params || `[]`)"
+        - name: parentRefCatalog
+          variable:
+            jmesPath: "parentRefParams[?name=='catalog'].value | [0] || ''"
+        - name: parentRefKind
+          variable:
+            jmesPath: "parentRefParams[?name=='kind'].value | [0] || ''"
+        - name: parentRefTemplateName
+          variable:
+            jmesPath: "parentRefParams[?name=='name'].value | [0] || ''"
+        # As in rule 1's variant: no request-level url, and type only omitted or 'artifact'.
+        - name: parentRefUrlCount
+          variable:
+            jmesPath: "length(parentRefParams[?name=='url'])"
+        - name: parentRefTypeIsArtifact
+          variable:
+            jmesPath: "length(parentRefParams[?name=='type']) == `0` || (length(parentRefParams[?name=='type']) == `1` && (parentRefParams[?name=='type'].value | [0]) == 'artifact')"
+        # A by-name reference to an approved template, or a hub-resolver reference to an
+        # approved template in the trusted catalog -- the same choice rule 1's variant makes.
+        # The uid comparison is the same one the base entry makes: the run fetched by name must
+        # be the object the owner reference points at. Both rules define runUid, so this entry
+        # is substituted into rule 2 and rule 3 unchanged.
+        - name: parentIsApprovedTemplate
+          variable:
+            jmesPath: "length(parentRuns) == `1` && parentRuns[0].metadata.uid == runUid && parentRuns[0].spec.pipelineSpec == null && (((parentRef.resolver || '') == '' && contains(templateNames, parentRef.name || '')) || ((parentRef.resolver || '') == 'hub' && parentRefUrlCount == `0` && parentRefTypeIsArtifact && parentRefCatalog == '<catalog-name>' && parentRefKind == 'pipeline' && contains(templateNames, parentRefTemplateName)))"
+```
+
+### Rule 3: no Pod outside a template \{#rule-3}
+
+Rules 1 and 2 judge Tekton's own objects. Whatever they admit — and whatever never reaches
+them — ends as a **Pod**, and the Pod is where the driver hands the credential out:
+`connectors-csi` mounts for any Pod whose volume names the Connector, however that Pod came to
+exist. A Pod written by hand, a `Deployment`, a `Job`, a `CronJob`, or any other controller's
+workload that mounts `<production-connector>` passes through neither rule — and neither does a
+Tekton `Task` that declares the volume in its own definition, because the run and the `TaskRun`
+that reference it carry no volume; only the Pod does. `no-pod-outside-a-template` closes all of
+that at the one place every path converges: a Pod that mounts the Connector must have been
+created by the Tekton controller, in `<pipeline-namespace>`, for a `PipelineRun` that
+references one of the templates by name — the parent reached through the Pod's controlling
+`ownerReference` to its `TaskRun`, and that `TaskRun`'s controlling `ownerReference` to the
+run: two API calls, and the same test rule 2 applies at the end. Labels are not consulted; the
+ones the controller stamps on a Pod include whatever `taskRunSpecs[].metadata.labels` the run's
+author chose. The second link holds because rule 2's `taskrun-owner-references-set-by-the-controller`
+keeps a hand-written `TaskRun` from carrying a controlling `PipelineRun` reference in the first
+place — from the moment the rule is installed, since it runs with `background: false` and judges
+admission-time creations and updates but never rescans objects that already exist; a `TaskRun`
+that predates the apply keeps whatever reference it was given, and draining those is the rollout
+step's job ([Rolling out](#rollout)) — and because it compares the whole reference, so an
+existing one cannot be renamed onto another run while keeping its `uid`. Each hop also checks
+that the object fetched by name carries the `uid` its reference names, so a renamed reference
+points nowhere. That is one more reason to deploy rules 2 and 3 together.
+
+This is the floor under the whole set. Rules 1 and 2 fail a bad request earlier, with a message
+that names what the run got wrong; rule 3 is what makes "only Tekton, only from a template"
+true for everything else that can declare a volume. Deploy it whenever rules 1 and 2 are
+deployed. The parent test is a *reference* test: the parent's content — its mappings, its pod
+template — was judged by rule 1, and by whichever of rules 5 to 11 are deployed, when the
+parent was created, which is why runs that
+predate the set must be drained before the set is trusted ([Rolling out](#rollout)). A Pod declares volumes in one place, `spec.volumes`, so its recognition preamble is
+shorter than the run rules'; the two Connector spellings are normalised the same way.
+
+Two properties of a Pod rule are worth knowing before applying it. Kyverno applies it to the
+workload kinds that produce Pods as well — `Deployment`, `StatefulSet`, `DaemonSet`, `Job`,
+`ReplicaSet`, `ReplicationController` and `CronJob` — by generating a matching rule for each
+(`autogen-no-pod-outside-a-template`, `autogen-cronjob-no-pod-outside-a-template`), so a
+`Deployment` that mounts the Connector is refused when the `Deployment` is created, not later
+when its controller tries to start a Pod; the refusal names the generated rule. And because the
+rule matches every Pod creation on the cluster, the fail-closed webhook it declares stops
+**all** Pod creation while Kyverno is unavailable, not only promotions — [Limits](#limits)
+weighs that trade-off.
+
+:::details Complete policy YAML — `no-pod-outside-a-template` (copy-paste ready)
+
+Replace in this block: `<promotion-pipeline>`, `<production-connector>`, `<pipeline-namespace>`, `<tekton-controller-identity>`.
+
+```yaml
+# Rule 3: a Pod that mounts the Connector must have been created by Tekton for a PipelineRun of a template.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: no-pod-outside-a-template
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: no-pod-outside-a-template
+      match:
+        any:
+          - resources:
+              kinds:
+                - Pod
+              operations:
+                - CREATE
+      context:
+        # The approved promotion templates: keep this list in step with rules 1 and 2.
+        - name: templateNames
+          variable:
+            value:
+              - <promotion-pipeline>
+        # A Pod declares volumes in exactly one place.
+        - name: csiAttrs
+          variable:
+            jmesPath: "(request.object.spec.volumes || `[]`)[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: connectorRefs
+          variable:
+            jmesPath: "[singleRefs, pluralRefs] | [] | [?@ != '']"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains(connectorRefs, '<production-connector>')"
+        # The Pod's TaskRun, from the controlling ownerReference the Tekton controller writes on
+        # every Pod it creates. Not a label: taskRunSpecs[].metadata.labels reach the Pod too.
+        - name: taskRunName
+          variable:
+            jmesPath: "(request.object.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'TaskRun'].name | [0] || ''"
+            default: ""
+        # The uid of that same reference: the TaskRun is fetched by name, and the uid is what
+        # proves the object found under that name is the one the reference points at.
+        - name: taskRunUid
+          variable:
+            jmesPath: "(request.object.metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'TaskRun'].uid | [0] || ''"
+            default: ""
+        # Read that TaskRun back: an empty list, not an error, when there is none.
+        - name: ownerTaskRuns
+          apiCall:
+            urlPath: "/apis/tekton.dev/v1/namespaces/{{request.namespace}}/taskruns?fieldSelector=metadata.name={{taskRunName}}"
+            jmesPath: "items || `[]`"
+        # The parent PipelineRun, from that TaskRun's controlling ownerReference -- which rule 2's
+        # second rule reserves for the Tekton controller to write.
+        - name: runName
+          variable:
+            jmesPath: "(length(ownerTaskRuns) == `1` && ownerTaskRuns[0].metadata.uid == taskRunUid && ((ownerTaskRuns[0].metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].name | [0])) || ''"
+            default: ""
+        # The uid of the same reference, read from the same TaskRun, for the parent test below.
+        - name: runUid
+          variable:
+            jmesPath: "(length(ownerTaskRuns) == `1` && ownerTaskRuns[0].metadata.uid == taskRunUid && ((ownerTaskRuns[0].metadata.ownerReferences || `[]`)[?controller == `true` && kind == 'PipelineRun'].uid | [0])) || ''"
+            default: ""
+        # Read the parent run back. A list query with a name selector returns an empty list --
+        # not an error -- when the reference is missing or names a run that does not exist.
+        - name: parentRuns
+          apiCall:
+            urlPath: "/apis/tekton.dev/v1/namespaces/{{request.namespace}}/pipelineruns?fieldSelector=metadata.name={{runName}}"
+            jmesPath: "items || `[]`"
+        - name: parentRef
+          variable:
+            jmesPath: "parentRuns[0].spec.pipelineRef || `{}`"
+        # The same test rule 1 applies to a run: a by-name reference to an approved template, no
+        # resolver, no inline pipelineSpec. The uid comparison keeps the lookup honest: the run
+        # fetched by name must be the object the owner reference points at, so a reference whose
+        # name was changed to another run resolves to no parent. Catalog-served templates:
+        # replace this entry with the seven under "Catalog-served templates: the parent test for
+        # rules 2 and 3" (under rule 2 in the guide).
+        - name: parentIsApprovedTemplate
+          variable:
+            jmesPath: "length(parentRuns) == `1` && parentRuns[0].metadata.uid == runUid && (parentRef.resolver || '') == '' && contains(templateNames, parentRef.name || '') && parentRuns[0].spec.pipelineSpec == null"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          A Pod that mounts the production registry Connector <production-connector> may only
+          be created by the Tekton controller for a PipelineRun in <pipeline-namespace> that
+          references an approved promotion template. got namespace={{ request.namespace }}
+          creator={{ request.userInfo.username }} owner taskRun={{ taskRunName }}
+          pipelineRun={{ runName }} parentRef={{ parentRef }}.
+        deny:
+          conditions:
+            any:
+              # One entry per namespace promotion runs are created in.
+              - key: "{{ request.namespace }}"
+                operator: AnyNotIn
+                value:
+                  - <pipeline-namespace>
+              - key: "{{ request.userInfo.username }}"
+                operator: NotEquals
+                value: <tekton-controller-identity>
+              - key: "{{ parentIsApprovedTemplate }}"
+                operator: Equals
+                value: false
+```
+
+:::
+
+**Catalog-served templates.** Replace the `parentIsApprovedTemplate` entry above exactly as
+[the parent test for rules 2 and 3](#catalog-parent-test) under rule 2 describes; the
+substitution is the same in both policies.
+
+### Rule 4: only maintainers change the templates
+
+**The first-choice answer to template integrity is not a policy.** Templates served from a
+governed catalog (the catalog variant of rule 1) are protected by the catalog's own release
+process and access control, and this rule is simply not needed — leave it out. Reach for it
+when the templates live in the namespace as `Pipeline` objects, and mind the trade-off: the
+team that owns the templates edits them through the maintainer identities, so the maintainer
+list below is one more thing to keep current.
+
+The promotion page keeps approvers and the Task reference inside the `Pipeline` so that a run
+cannot override them. That is only as strong as the `Pipeline` objects themselves.
+`template-changes-by-maintainers-only` matches create, update and delete of the named templates
+in `<pipeline-namespace>` and refuses any requester not listed as a `<template-maintainer>`.
+It protects namespace-local templates; templates served from a catalog are governed by the
+catalog instead, which is what makes this rule optional.
+
+The rule sets `allowExistingViolations: false`. Its condition depends on the requester rather
+than on the object, and without that setting Kyverno evaluates an update against the old object
+too, finds the same "violation" there, and admits the update as pre-existing — which would leave
+exactly the operation the rule exists for unguarded.
+
+:::details Complete policy YAML — `template-changes-by-maintainers-only` (copy-paste ready)
+
+Replace in this block: `<pipeline-namespace>`, `<promotion-pipeline>`, `<template-maintainer>`.
+
+```yaml
+# Rule 4: the templates themselves may only be changed by their maintainers.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: template-changes-by-maintainers-only
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: template-changes-by-maintainers-only
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/Pipeline
+              # One entry per namespace promotion runs are created in.
+              namespaces:
+                - <pipeline-namespace>
+              # Add one entry per approved template, as in rule 1.
+              names:
+                - <promotion-pipeline>
+              operations:
+                - CREATE
+                - UPDATE
+                - DELETE
+      validate:
+        failureAction: Enforce
+        # The deny condition depends on the requester, not on the object. Without this, Kyverno
+        # also evaluates the old object on UPDATE, finds the same "violation" and waves the
+        # update through as pre-existing.
+        allowExistingViolations: false
+        message: >-
+          This Pipeline is a promotion template and may only be changed by its
+          maintainers. got {{ request.userInfo.username }}.
+        deny:
+          conditions:
+            all:
+              - key: "{{ request.userInfo.username }}"
+                operator: AnyNotIn
+                value:
+                  - <template-maintainer>
+```
+
+:::
+
+### Rule 5: approvers come from the namespace's allowed list
+
+The template names its approvers, and rule 4 keeps that from being edited — but that protection
+is namespace-local and coarse: any maintainer edit is allowed, and a template that takes its
+approvers as a run parameter would let whoever starts the run choose who approves it.
+`promotion-approvers` pins the *values*: one policy object with two rules sharing one
+`allowedApprovers` list. `run-approvers-from-the-allowed-list` refuses a promotion run whose
+`approvers` parameter names anyone outside the list — whoever creates the run, whatever the
+template does with the parameter. `template-approvers-from-the-allowed-list` refuses a
+`Pipeline` — template or not, maintainer or not — whose `ApprovalTask` steps name anyone
+outside it. It judges creations and edits, not what already exists: audit pre-existing
+templates once at rollout ([Rolling out](#rollout)).
+
+The same list is checked later by the approval machinery itself ([Who May Approve](#approval)),
+but later is the point: this rule fails the request at admission, before a run exists that an
+unlisted approver could wave through, instead of after the pipeline has started and stopped at
+an approval nobody trusted was allowed to give.
+
+Both rules read the parameter whether it is an array or a single string. A run that passes no
+`approvers` parameter is untouched — the template's own reviewed list, or the parameter's
+default, applies, and both are themselves held to `allowedApprovers` by the second rule. The
+parameter name `approvers` is pinned; a template that names it differently needs the rule
+adjusted.
+
+Two consequences are worth spelling out. The recommended default remains a fixed, reviewed
+approver surface in the template ([Who May Approve](#approval)); run-time approvers are the
+variant for teams whose promotions genuinely need them, supported through exactly one
+shape: a template may plumb the parameter named `approvers` into its `ApprovalTask`
+(`value: $(params.approvers[*])` for an array, `value: $(params.approvers)` for a string) —
+the run side then judges the values each run supplies, and the template side judges the
+parameter's default. A reference to any *other* parameter name is refused as an unlisted
+literal, deliberately: the run side only reads the parameter named `approvers`, so a
+differently named parameter would smuggle names past it. And the template side judges
+`Pipeline` objects in `<pipeline-namespace>` only: a template served from a catalog never
+passes through cluster admission, so its hard-coded approvers are part of the reviewed catalog
+content — the same trust boundary as the catalog variant of rule 1 — and the approval
+machinery's own late check still applies to whatever the run ends up waiting on.
+
+:::details Complete policy YAML — `promotion-approvers` (copy-paste ready)
+
+Replace in this block: `<allowed-approver>`, `<production-connector>`, `<pipeline-namespace>`.
+
+```yaml
+# Rule 5: promotion approvers must come from the allowed list.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: promotion-approvers
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    # 5a: a run that passes an approvers parameter may only name allowed approvers.
+    - name: run-approvers-from-the-allowed-list
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Who may approve promotions in this namespace: add one entry per identity or group.
+        - name: allowedApprovers
+          variable:
+            value:
+              - <allowed-approver>
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        # The run's approvers parameter, whether declared as an array or a single string.
+        - name: runApprovers
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='approvers'].value | [0] || `[]`)"
+        # Inside a JMESPath filter the context is the element, so the allowed list is injected
+        # by substitution rather than referenced by name.
+        - name: badApprovers
+          variable:
+            jmesPath: "runApprovers[?!contains(`{{ allowedApprovers }}`, @)]"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          Promotion approvers must come from the allowed list
+          {{ allowedApprovers }}. offending approvers {{ badApprovers }}.
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(badApprovers) }}"
+                operator: GreaterThan
+                value: 0
+    # 5b: the template's own ApprovalTask steps may only name allowed approvers.
+    - name: template-approvers-from-the-allowed-list
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/Pipeline
+              operations:
+                - CREATE
+                - UPDATE
+              # Approver conventions are per namespace: only the promotion namespaces'
+              # Pipelines are judged (one entry per namespace), other namespaces are left alone.
+              namespaces:
+                - <pipeline-namespace>
+      context:
+        # Keep this list identical to the one in run-approvers-from-the-allowed-list.
+        - name: allowedApprovers
+          variable:
+            value:
+              - <allowed-approver>
+        # Every approvers value of every ApprovalTask step, in tasks and finally alike.
+        - name: rawTemplateApprovers
+          variable:
+            jmesPath: "[(request.object.spec.tasks || `[]`), (request.object.spec.finally || `[]`)] | [] | [?taskRef.kind=='ApprovalTask'] | [].params | [] | [?name=='approvers'] | [].value"
+        # Each value may be an array or a single string; coerce and flatten.
+        - name: templateApprovers
+          variable:
+            jmesPath: "map(&to_array(@), rawTemplateApprovers) | []"
+        # Run-time approvers are supported through exactly one shape: plumbing from a Pipeline
+        # parameter named "approvers", whose values the run rule validates at admission. A
+        # reference to any other parameter is judged as a literal, because a differently named
+        # parameter would escape the run rule. The dollar and parentheses are regex-escaped so
+        # Kyverno does not mistake the Tekton reference for one of its own variables.
+        - name: literalApprovers
+          variable:
+            jmesPath: "templateApprovers[?!regex_match('^\\$\\(params\\.approvers(\\[\\*\\])?\\)$', @)]"
+        # The parameter's default applies whenever a run omits approvers, and the run rule
+        # never sees it — judge it here alongside the literals.
+        - name: approverDefaults
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='approvers'].default | [0] || `[]`)"
+        # Inside a JMESPath filter the context is the element, so the allowed list is injected
+        # by substitution rather than referenced by name.
+        - name: badApprovers
+          variable:
+            jmesPath: "[literalApprovers, approverDefaults] | [] | [?!contains(`{{ allowedApprovers }}`, @)]"
+      validate:
+        failureAction: Enforce
+        # As in rule 4: without this, an UPDATE that keeps a pre-existing offending approver
+        # would be admitted as a pre-existing violation.
+        allowExistingViolations: false
+        message: >-
+          ApprovalTask approvers in <pipeline-namespace> must come from the allowed list
+          {{ allowedApprovers }}, or be plumbed from a run parameter named approvers.
+          offending approvers {{ badApprovers }}.
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(badApprovers) }}"
+                operator: GreaterThan
+                value: 0
+```
+
+:::
+
+### Rule 6: sources must come from an approved registry
+
+Every `imageMappings` source must start with `docker://` plus an approved host. A promotion
+moves an artifact out of the registry where it was built and tested; a source anywhere else has
+no such history. The check is a `foreach` over the mappings: each source is
+compared against a list of approved-registry wildcard patterns in a single condition —
+trusting another registry is adding one entry to that list, not writing a new condition:
+
+:::details Complete policy YAML — `sources-from-approved-registries` (copy-paste ready)
+
+Replace in this block: `<production-connector>`, `<approved-source-registry>`.
+
+```yaml
+# Rule 6: sources must come from an approved source registry.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: sources-from-approved-registries
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: sources-from-approved-registries
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        # Coerced to a list so that even a single-string value is judged; the shape rule
+        # separately refuses the non-list form.
+        - name: mappings
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`)"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          Every imageMappings source must come from an approved source registry.
+          got {{ mappings }}.
+        foreach:
+          - list: "mappings"
+            context:
+              - name: src
+                variable:
+                  jmesPath: "split(element, ' ') | [0] || ''"
+            deny:
+              conditions:
+                # The approved source registries, one wildcard pattern per entry. A source
+                # matching none of the patterns is refused; to trust another registry, add
+                # its entry to this list.
+                any:
+                  - key: "{{ src }}"
+                    operator: AllNotIn
+                    value:
+                      - "docker://<approved-source-registry>/*"
+```
+
+:::
+
+### Rule 7: destinations must land in an approved registry
+
+Every `imageMappings` destination must start with `docker://` plus an approved target host. The
+Connector already limits *where the credential works*; this rule limits *where the run is
+allowed to aim*, so that a mapping pointing elsewhere is refused up front rather than failing
+inside the copy. Teams that do not restrict destination names simply do not apply it. The shape
+mirrors rule 6 — one wildcard-pattern entry per approved host:
+
+:::details Complete policy YAML — `targets-in-approved-registries` (copy-paste ready)
+
+Replace in this block: `<production-connector>`, `<approved-target-registry>`.
+
+```yaml
+# Rule 7: destinations must land in an approved target registry.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: targets-in-approved-registries
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: targets-in-approved-registries
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        # Coerced to a list so that even a single-string value is judged; the shape rule
+        # separately refuses the non-list form.
+        - name: mappings
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`)"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          Every imageMappings destination must land in an approved target registry.
+          got {{ mappings }}.
+        foreach:
+          - list: "mappings"
+            context:
+              - name: dst
+                variable:
+                  jmesPath: "split(element, ' ') | [1] || ''"
+            deny:
+              conditions:
+                # The approved target registries, one wildcard pattern per entry, as in the
+                # sources rule.
+                any:
+                  - key: "{{ dst }}"
+                    operator: AllNotIn
+                    value:
+                      - "docker://<approved-target-registry>/*"
+```
+
+:::
+
+### Rule 8: mappings must be present and well formed
+
+`imageMappings` must be a non-empty **list** in which every item is exactly `SRC DST`: two
+space-delimited references, with no embedded newline, tab, or carriage return. A run with no mappings would hold the credential and copy nothing, which is never a
+promotion; a malformed item is refused because the rules that judge content cannot judge what
+they cannot parse. This is also the rule that owns the list requirement: rules 6, 7, 9 and 11
+coerce a single-string value and judge its content, but only this rule refuses the non-list
+form itself (which Tekton would also reject at run time against the template's `array`
+parameter).
+
+:::details Complete policy YAML — `mapping-shape` (copy-paste ready)
+
+Replace in this block: `<production-connector>`.
+
+```yaml
+# Rule 8: mappings must be present, and each one a single-line "SRC DST" pair.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: mapping-shape
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: mapping-shape
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        # The raw value: this rule is the one that checks it IS a list, so no coercion here.
+        - name: mappings
+          variable:
+            jmesPath: "(request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`"
+        # imageMappings must be a list; a single string is refused explicitly below.
+        - name: mappingsIsList
+          variable:
+            jmesPath: "type(mappings) == 'array'"
+        - name: malformed
+          variable:
+            jmesPath: "to_array(mappings)[?length(split(@, ' ')) != `2` || contains(@, '\n') || contains(@, '\t') || contains(@, '\r')]"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          imageMappings must be a non-empty list of single-line "SRC DST" pairs.
+          isList={{ mappingsIsList }} count={{ length(mappings) }} malformed={{ malformed }}.
+        deny:
+          conditions:
+            any:
+              - key: "{{ mappingsIsList }}"
+                operator: Equals
+                value: false
+              - key: "{{ length(mappings) }}"
+                operator: Equals
+                value: 0
+              - key: "{{ length(malformed) }}"
+                operator: GreaterThan
+                value: 0
+```
+
+:::
+
+### Rule 9: the destination repository must match the source
+
+`target-path-matches-source` compares the repository path — everything after the registry host,
+before the tag or digest — on both sides of each mapping. `team/app` must land in `team/app`.
+A port on the host is part of the host, not the path: `registry.example.com:5000/team/app` and
+`registry.example.com/team/app` share the path `team/app`, and the port's colon never reaches
+the tag comparison, because the host is dropped before the tag is looked at.
+The tag or digest may differ, so `app:1.2.3` may be promoted as `app:stable`, and the `.sig` and
+`.att` companions of a digest-pinned image pass unchanged. A destination in a different
+repository is refused: an approval covers an artifact, not a rename. The two paths are compared
+inside JMESPath rather than by a Kyverno operator, because the operators read a purely numeric
+string as a number — `0123` would otherwise equal `123`, and the rename would be admitted.
+
+:::details Complete policy YAML — `target-path-matches-source` (copy-paste ready)
+
+Replace in this block: `<production-connector>`.
+
+```yaml
+# Rule 9: the destination repository must match the source repository (a promotion is not a rename).
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: target-path-matches-source
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: target-path-matches-source
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        # The driver trims whitespace around each entry, drops empty entries, and resolves a
+        # bare "name" in the run's namespace; mirror that before comparing, or a padded or
+        # unqualified spelling of the production Connector escapes detection.
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        # Coerced to a list so that even a single-string value is judged; the shape rule
+        # separately refuses the non-list form.
+        - name: mappings
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`)"
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          The destination repository must equal the source repository; only the registry host and
+          the tag or digest may differ. got {{ mappings }}.
+        foreach:
+          - list: "mappings"
+            context:
+              # Repository path = everything after the registry host, before the tag (:) or
+              # digest (@). The host — port and all — is dropped first, so a port's colon can
+              # never be mistaken for the tag separator.
+              - name: srcRepo
+                variable:
+                  jmesPath: "split(element, ' ') | [0] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @) | split(@, '@') | [0] | split(@, ':') | [0]"
+              - name: dstRepo
+                variable:
+                  jmesPath: "split(element, ' ') | [1] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @) | split(@, '@') | [0] | split(@, ':') | [0]"
+              # Compared here, not by a Kyverno operator: an operator reads a purely numeric
+              # repository name as a number, and "0123" would then equal "123".
+              - name: repoMismatch
+                variable:
+                  jmesPath: "srcRepo != dstRepo"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ repoMismatch }}"
+                    operator: Equals
+                    value: true
+```
+
+:::
+
+**Stricter variant: forbid retagging as well.** In the collapsed policy above, replace the
+comment and the two entries named `srcRepo` and `dstRepo` in the `foreach` block's `context`
+with the block below — the comment goes too, because it describes the base rule's parsing and
+this variant keeps the tag:
+
+```yaml
+              # Repository path plus the tag or digest = everything after the registry host.
+              # The host — port and all — is still dropped first; only the reference it
+              # carries is compared, so a port's colon is never part of the comparison.
+              - name: srcRepo
+                variable:
+                  jmesPath: "split(element, ' ') | [0] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @)"
+              - name: dstRepo
+                variable:
+                  jmesPath: "split(element, ' ') | [1] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @)"
+```
+
+With this variant, promoting `app:1.2.3` as `app:stable` is refused, and so is the multi-tag
+pattern the promotion page documents under *Promote One Image to Multiple Destinations*.
+
+### Rule 10: the templates expose only the reviewed inputs
+
+The guardrails read `imageMappings` and `approvers` because those are the inputs the reviewed
+templates expose — and `skopeo-copy` itself accepts more: `srcImage` and `dstImages` name
+content to copy, the `copy-mappings` workspace feeds mappings in from a file, `skopeoImage`
+replaces the executing image and `extraCopyArgs` its arguments. A run cannot reach any of
+them: rule 1 pins runs to the templates, and Tekton silently drops parameters a template does
+not declare. The one path left is a maintainer edit that widens the template itself, and
+`templates-expose-only-reviewed-inputs` closes it: on the named templates, the copy step's
+parameters and workspaces are whitelists, so an input added later — including one this guide
+has never heard of — is refused until it is reviewed into the lists. The CA-bundle workspaces are
+the worked example, already carried out: the promotion page's template exposes `src-ca-bundle` and
+`dst-ca-bundle` as optional workspaces so a proxied copy can keep TLS verification on — a
+Connector-backed run binds the destination one to the Connector mount for its `ca.crt`, and the
+source one takes the site's own CA — and both names sit in `allowedCopyWorkspaces` below. The
+rule also refuses an inline `taskSpec` anywhere in
+the template. That is not a second concern but the same one: the whitelists find the copy step
+through its `taskRef`, so a step rewritten inline would present no parameters and no workspaces to
+compare and would pass every check while running whatever it liked. Promotion templates reference
+every task they run — from the namespace or from a catalog — so refusing inlining costs the
+reviewed shape nothing. The promotion page's `srcImage`/`dstImages` alternative is different —
+whitelisting it here would not make
+it safe, because rules 6–9 and 11 judge only `imageMappings` and would never see what it copies;
+that form stays outside the guardrails, as its own section says. Other Pipelines in the
+namespace are left alone; if one of them mounts the Connector, rule 1 already refuses it.
+Templates served from a catalog are not `Pipeline` objects in the namespace, so this rule
+cannot see them: their input surface is governed by the catalog's own release process, as
+rule 4 leaves their edits to it.
+
+:::details Complete policy YAML — `templates-expose-only-reviewed-inputs` (copy-paste ready)
+
+Replace in this block: `<promotion-pipeline>`, `<pipeline-namespace>`.
+
+```yaml
+# Rule 10: the promotion templates' copy step exposes only the reviewed inputs.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: templates-expose-only-reviewed-inputs
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: templates-expose-only-reviewed-inputs
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/Pipeline
+              operations:
+                - CREATE
+                - UPDATE
+              # Only the promotion templates are judged: another Pipeline in the namespace may
+              # use skopeo-copy however it likes — if it mounts the Connector, rule 1 refuses
+              # it for not being a template.
+              names:
+                - <promotion-pipeline>
+              # One entry per namespace promotion runs are created in.
+              namespaces:
+                - <pipeline-namespace>
+      context:
+        # The copy inputs the reviewed templates pass. Anything else — srcImage, dstImages,
+        # skopeoImage, extraCopyArgs, or a parameter added later — is refused until it is
+        # reviewed into this list.
+        - name: allowedCopyParams
+          variable:
+            value:
+              - imageMappings
+              - srcTLSVerify
+              - dstTLSVerify
+        # The workspaces the reviewed templates bind. Keeps copy-mappings — a file-based second
+        # way to feed mappings — from appearing unreviewed. The two CA-bundle workspaces are
+        # reviewed in: the promotion template exposes both so a run can keep TLS verification on
+        # instead of turning it off — a Connector-backed run binds the destination one to the
+        # mount holding the proxy's ca.crt, and the source one takes the site's own CA.
+        - name: allowedCopyWorkspaces
+          variable:
+            value:
+              - src-registry-config
+              - dst-registry-config
+              - src-ca-bundle
+              - dst-ca-bundle
+        # Every task, in tasks and finally alike, that runs skopeo-copy: referenced through a
+        # resolver whose name parameter says so, or directly by name.
+        - name: copySteps
+          variable:
+            jmesPath: "[(request.object.spec.tasks || `[]`), (request.object.spec.finally || `[]`)] | [] | [?taskRef.name=='skopeo-copy' || contains((taskRef.params || `[]`)[?name=='name'].value, 'skopeo-copy')]"
+        # A copy step rewritten as an inline taskSpec has no taskRef for the filter above to
+        # recognise, so the allowlists would be empty. Promotion templates reference every task.
+        - name: inlineTasks
+          variable:
+            jmesPath: "[(request.object.spec.tasks || `[]`), (request.object.spec.finally || `[]`)] | [] | [?taskSpec != null].name"
+        # Inside a JMESPath filter the context is the element, so the allowed lists are
+        # injected by substitution rather than referenced by name.
+        - name: unexpectedParams
+          variable:
+            jmesPath: "map(&(params || `[]`)[].name, copySteps) | [] | [?!contains(`{{ allowedCopyParams }}`, @)]"
+        - name: unexpectedWorkspaces
+          variable:
+            jmesPath: "map(&(workspaces || `[]`)[].name, copySteps) | [] | [?!contains(`{{ allowedCopyWorkspaces }}`, @)]"
+      validate:
+        failureAction: Enforce
+        # As in rule 5's template side: catch the edit that introduces the input, not only a
+        # brand-new Pipeline.
+        allowExistingViolations: false
+        message: >-
+          The copy step of a promotion template takes only the reviewed inputs: params
+          {{ allowedCopyParams }}, workspaces {{ allowedCopyWorkspaces }}, and every task
+          referenced rather than inlined. unexpected params {{ unexpectedParams }}, unexpected
+          workspaces {{ unexpectedWorkspaces }}, inline tasks {{ inlineTasks }}.
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(unexpectedParams) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ length(unexpectedWorkspaces) }}"
+                operator: GreaterThan
+                value: 0
+              # An inline taskSpec hides the copy step from both allowlists, so it is refused
+              # on its own -- the two lists above would have nothing to judge.
+              - key: "{{ length(inlineTasks) }}"
+                operator: GreaterThan
+                value: 0
+```
+
+:::
+
+### Rule 11: sources carry a release tag \{#rule-11}
+
+The parity rule keeps a promotion inside one repository; it says nothing about *which build*
+of that repository may be promoted. `app:latest`, `app:dev-20260902`, a branch tag, or an
+untagged reference (an implicit `latest`) all satisfy rules 6 to 9 and would be promoted with
+the approval. This rule requires every `imageMappings` source to be a release artifact: pinned
+by digest (`@sha256:` followed by 64 hex digits), or carrying a tag that matches one of the
+approved patterns — one regular expression per entry, the semver.org grammar with an optional
+`v` prefix by default. The second default entry admits
+the `sha256-<digest>.sig` / `.att` / `.sbom` tags cosign stores beside a digest-pinned image,
+so a signed image promotes together with its signature and attestation. Destinations are not
+judged: retagging `app:1.2.3` as `app:stable` on the way in stays allowed, as the parity rule
+intends. Teams whose release tags follow another convention put their patterns in the list;
+teams that do not gate on tags simply do not apply the rule. The tag is read from the last
+path segment of the reference, so a registry port (`host:5000/team/app:1.2.3`) is not mistaken
+for a tag.
+
+Two patterns are ready to copy into `<approved-source-tag-pattern>`. The default is the
+semver.org grammar, `v` prefix optional — it admits pre-release and build-metadata tags such
+as `1.2.3-rc.1`, for teams that promote release candidates through the same path:
+
+```text
+^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-((0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*)(\.(0|[1-9][0-9]*|[0-9]*[A-Za-z-][0-9A-Za-z-]*))*))?(\+([0-9A-Za-z-]+(\.[0-9A-Za-z-]+)*))?$
+```
+
+The strict form admits only `v?major.minor.patch` — `1.2.3` and `v1.2.3`, never `1.2.3-rc.1`,
+`1.2.3+build.5` or `01.2.3` — for teams whose production may carry final releases only:
+
+```text
+^v?(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)$
+```
+
+:::details Complete policy YAML — `sources-carry-release-tags` (copy-paste ready)
+
+Replace in this block: `<production-connector>`, `<approved-source-tag-pattern>`.
+
+```yaml
+# Rule 11: sources must be release artifacts -- pinned by digest or carrying a release tag.
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: sources-carry-release-tags
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: sources-carry-release-tags
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              operations:
+                - CREATE
+      context:
+        # Every place a connectors-csi volume can be declared on a run: workspace bindings, pod
+        # templates (spec.podTemplate on a TaskRun, taskRunTemplate and taskRunSpecs on a
+        # PipelineRun -- one list serves both kinds), and the volumes of an inline Task spec.
+        - name: csiVolumes
+          variable:
+            jmesPath: "[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []"
+        - name: csiAttrs
+          variable:
+            jmesPath: "csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes"
+        - name: singleRefs
+          variable:
+            jmesPath: "csiAttrs[?\"connector.name\" != null].join('/', [\"connector.namespace\" || '{{request.namespace}}', \"connector.name\"])"
+        - name: rawPluralRefs
+          variable:
+            jmesPath: "csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')"
+        - name: pluralRefs
+          variable:
+            jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+        - name: mountsProductionConnector
+          variable:
+            jmesPath: "contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')"
+        - name: mappings
+          variable:
+            jmesPath: "to_array((request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`)"
+        # The tag formats that mark a release artifact, one regular expression per entry; a
+        # source pinned by digest (@sha256:...) is always accepted. The second entry keeps the
+        # signature, attestation and SBOM tags cosign stores beside a digest-pinned image
+        # promotable together with it.
+        - name: approvedSourceTagPatterns
+          variable:
+            value:
+              # Single-quoted so the backslashes in a pattern need no escaping.
+              - '<approved-source-tag-pattern>'
+              - '^sha256-[0-9a-f]{64}\.(sig|att|sbom)$'
+      preconditions:
+        all:
+          - key: "{{ mountsProductionConnector }}"
+            operator: Equals
+            value: true
+      validate:
+        failureAction: Enforce
+        message: >-
+          Every imageMappings source must be pinned by digest or carry a release tag matching
+          the approved patterns; an untagged source (implicit latest) is refused.
+          got {{ mappings }}.
+        foreach:
+          - list: "mappings"
+            context:
+              - name: src
+                variable:
+                  jmesPath: "split(element, ' ') | [0] || ''"
+              # A reference must carry a repository path after the transport and host
+              # ("docker://host/repo..."); a host-only reference has nothing to promote, and
+              # its port must not be read as a tag.
+              - name: hasRepositoryPath
+                variable:
+                  jmesPath: "contains(split(src, '//') | [-1] || '', '/')"
+              # The last path segment holds the tag or digest: "app:1.2.3", "app@sha256:...", "app".
+              # Taking it after the last "/" keeps a registry port ("host:5000/...") out of the way.
+              - name: lastSegment
+                variable:
+                  jmesPath: "split(src, '/') | [-1] || ''"
+              # Pinned means a real digest: "@sha256:" followed by 64 hex digits, so that
+              # "app@foo" or a truncated digest does not pass as pinned.
+              # The repository name is what is left of the last segment before any ":" or "@";
+              # "docker://host/:1.2.3" has none and is refused.
+              - name: repositoryName
+                variable:
+                  jmesPath: "split(split(lastSegment, '@') | [0] || '', ':') | [0] || ''"
+              - name: digestPinned
+                variable:
+                  jmesPath: "regex_match('@sha256:[0-9a-f]{64}$', lastSegment)"
+              - name: tag
+                variable:
+                  jmesPath: "contains(lastSegment, ':') && (split(lastSegment, ':') | [-1]) || ''"
+              # The patterns (trusted, from this policy) are joined into one alternation and the
+              # tag is passed as a value, never spliced into the expression: a tag carrying a
+              # quote is simply refused instead of breaking the evaluation.
+              - name: tagApproved
+                variable:
+                  jmesPath: "tag != '' && regex_match(join('|', map(&join('', ['(', @, ')']), approvedSourceTagPatterns)), tag)"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ hasRepositoryPath }}"
+                    operator: Equals
+                    value: false
+                  - key: "{{ repositoryName }}"
+                    operator: Equals
+                    value: ""
+                  - key: "{{ digestPinned || tagApproved }}"
+                    operator: Equals
+                    value: false
+```
+
+:::
+
+## Composing the Rules \{#composing}
+
+Adopting the guardrails is choosing a subset and operating it as one unit. The subset has a
+floor: rules 1, 2 and 3 always, and rule 4 whenever the templates are `Pipeline` objects in
+the namespace — without it, anyone who can update a `Pipeline` there can replace the reviewed
+template under its approved name, and rules 1, 2 and 3 will keep trusting that name. Save each chosen
+rule's object — or all of them in one file, separated by `---`, or a few bundles built as in
+[Bundling rules into fewer objects](#bundling) — replace the placeholders, keep
+the file in version control, and apply it. The shared label is the handle for everything that
+follows:
+
+```bash
+kubectl apply -f promotion-guardrails.yaml
+
+kubectl get clusterpolicy -l app.kubernetes.io/part-of=promotion-guardrails
+# Expect ADMISSION=true and READY=True with MESSAGE=Ready on every row. A rule that fails to
+# compile is reported in these columns, not at run time.
+
+# READY says a policy compiled, not that it blocks anything. Read each rule's action:
+for p in $(kubectl get clusterpolicy -l app.kubernetes.io/part-of=promotion-guardrails -o name); do
+  kubectl get "$p" -o jsonpath='{.metadata.name}{"\t"}{.spec.rules[*].validate.failureAction}{"\n"}'
+done
+# Expect Enforce in every column (rules 2 and 5 print one action per rule). A rule left on
+# Audit records and admits.
+```
+
+Three consequences of the one-object-per-guardrail shape are worth spelling out:
+
+- **Dropping a guardrail is deleting an object**, not editing YAML inside a shared policy — and
+  adding one later does not touch the ones already running.
+- **Denials name the rule.** A defective request that violates several deployed rules is
+  refused once, with every violated rule listed under its own policy name in the message.
+- **Reports attribute per rule.** Each policy produces its own `PolicyReport` results, so
+  "which constraint would this run have violated" is readable per rule during an `Audit`
+  observation window.
+
+### Bundling rules into fewer objects \{#bundling}
+
+One object per guardrail is the shape this guide ships, because it makes each rule a unit
+you can apply, audit and delete on its own. Nothing requires it: a `ClusterPolicy` holds any
+number of entries under `spec.rules`, each with its own `match`, `context`, `preconditions`
+and `validate`, and the objects of rules 2 and 5 already carry two each. Three techniques reduce the count or
+the repetition, in increasing order of what they change. The first and the third change only
+the deploying objects, not what is refused: verified, the same requests are refused by the same
+rule names with the objects replaced. The second was verified with a server dry run that shows
+the alias expanded.
+
+**Concatenate the rules lists.** Rule names are unique across the set, so bundling needs no
+renaming. Group by lifecycle rather than by count: the rules you will switch on, audit and
+roll back together belong together — the core trio (rules 1 to 3), the template rules
+(4, 5 and 10) and the content rules (6 to 9 and 11). Build a bundle from the policy files
+above with `yq` (Mike Farah's yq v4, `yq --version`) — one file per guardrail, rule 5's
+contributing its two rules; the expression keeps every field of the
+first file except `rules`, which becomes the concatenation, and `metadata.name`, which it
+sets, so every other field of the inputs must agree — in this guide they do; check in
+particular `background`, `admission`, `webhookConfiguration`, `applyRules` and any
+`validationFailureAction` you may have added, since a difference there would be taken
+silently from the first file:
+
+Replace in this block: `<bundle-name>`, `<first-rule-file>`, `<next-rule-file>`.
+
+```bash
+# One command per bundle; one argument per policy file, in the order you want the rules
+# evaluated -- three for the core trio, five for the content rules.
+yq eval-all '([.spec.rules[]]) as $r | select(fileIndex == 0) | .spec.rules = $r | .metadata.name = "<bundle-name>"' \
+  <first-rule-file>.yaml <next-rule-file>.yaml ... > <bundle-name>.yaml
+
+# Expect: the bundle name, then two equal numbers -- the rules counted, and the distinct
+# rule names. A smaller second number means duplicate rule names, for example a file listed
+# twice.
+yq '.metadata.name, (.spec.rules | length), ([.spec.rules[].name] | unique | length)' <bundle-name>.yaml
+```
+
+Four things change when rules share an object, none of them in what the rules decide:
+
+- **An invalid rule takes the whole bundle out of service.** Kyverno rejects some mistakes
+  at `kubectl apply`; others get through and leave the object `READY=False` — and a policy
+  that is not ready evaluates **none** of its rules, so every guardrail in that bundle is
+  silently absent until it compiles. (`failurePolicy: Fail` is about the webhook being
+  unreachable or a rule erroring during evaluation; it does not cover a policy that never
+  loaded.) Check `READY` after every apply, as [Composing](#composing) already does, and try
+  a new bundle on a test cluster — or as a namespaced `Policy` copy in a scratch namespace —
+  before it carries production.
+- **Rollback granularity is the bundle.** The emergency delete under
+  [Rolling out](#rollout) removes a whole bundle; the Audit switch there patches every rule
+  of every object and needs no change.
+- **Reports and denials name the bundle.** `PolicyReport` results carry the bundle in
+  `policy` and the rule in `rule`, and a denial message is headed by the bundle name with the
+  rule beneath it. The post-run check under
+  [Check it against a real promotion run](#real-run) filters by policy name — replace the
+  single-rule names in its `jq` list with your bundle names; the `kind/rule=result` lines it
+  compares are unchanged.
+- **`context` stays per rule.** Kyverno shares nothing between rules, so the Connector
+  recognition preamble is still repeated in every rule that recognises the Connector — nine
+  of the thirteen rule entries; rules 4 and 10 and rule 5's template side judge `Pipeline`
+  objects, and rule 2's owner-reference rule judges every `TaskRun`, so those four carry none.
+  Bundling reduces the object count, not the YAML. The two techniques below address that.
+
+Swap in the safe order: apply the bundles, wait for `READY=True`, then delete the per-guardrail
+objects they replace — and the same order going back. While both exist the Connector stays
+guarded, but every request is judged twice: a denial lists both objects, `PolicyReport`
+carries two rows per check, and the exact-count checks under
+[Check it against a real promotion run](#real-run) fail until the old objects are gone. A gap
+between delete and apply is worse, because nothing guards the Connector in between. Both shapes carry the shared label, so
+the label selector under Rolling out finds either.
+
+**Author the preamble once with a YAML anchor.** Within one file, YAML anchors let a bundle
+declare the recognition preamble a single time and reference it from every rule — the
+server receives the expanded copies, so nothing changes at run time, but an edit to the
+preamble is made in one place:
+
+```yaml
+  rules:
+    - name: promotion-runs-use-a-template
+      match: ...
+      context: &connector-preamble
+        - name: csiVolumes
+          variable:
+            jmesPath: "..."
+        # ... the rest of the preamble, exactly as in the single-rule object
+      validate: ...
+    - name: no-taskrun-outside-a-template
+      match: ...
+      context: *connector-preamble
+      validate: ...
+```
+
+`kubectl` resolves the alias before sending the object; a server dry run of such a bundle
+shows the second rule with the full context list. Anchors do not cross documents, so this
+only helps within a bundle, and a rule that needs one extra entry cannot append to an alias —
+give it its own list.
+
+**Fold same-shaped rules into one rule.** The content rules (6 to 9 and 11) share their
+`match`, precondition and `imageMappings` extraction; they can become one rule with one
+preamble, one `foreach` over the mappings and every check as a condition of the same `deny`.
+What is given up is attribution: a rule yields one result and one message, so which check
+refused is visible only in values the message echoes, `PolicyReport` shows one row for the
+five, and a denial names `promotion-content` where it named one of the five (the same requests
+are refused; only the name changes). The checks under
+[Check it against a real promotion run](#real-run) change the same way: in the post-run
+script, list `promotion-content` in the `jq` policy filter and replace the five
+`PipelineRun/<content rule>=pass` entries of `expected` with one
+`PipelineRun/promotion-content=pass` (the script's comment then counts three `PipelineRun`
+rules, not seven), and the renamed-copy check must look for the `promotion-content:` heading
+instead of `target-path-matches-source:`. Choose this when one
+switch for "content" is what you want; keep separate rules when you need to see which one
+fired.
+
+:::details Complete policy YAML — `promotion-content`, the five content rules as one (copy-paste ready)
+
+Replace in this block: `<production-connector>`, `<approved-source-registry>`, `<approved-target-registry>`, `<approved-source-tag-pattern>`.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: promotion-content
+  labels:
+    app.kubernetes.io/part-of: promotion-guardrails
+spec:
+  admission: true
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+  - name: promotion-content
+    match:
+      any:
+      - resources:
+          kinds:
+          - tekton.dev/v1/PipelineRun
+          operations:
+          - CREATE
+    context:
+    - name: csiVolumes
+      variable:
+        jmesPath: '[request.object.spec.workspaces, request.object.spec.podTemplate.volumes, request.object.spec.taskRunTemplate.podTemplate.volumes, (request.object.spec.taskRunSpecs || `[]`)[].podTemplate.volumes, request.object.spec.taskSpec.volumes, (request.object.spec.pipelineSpec.tasks || `[]`)[].taskSpec.volumes, (request.object.spec.pipelineSpec.finally || `[]`)[].taskSpec.volumes] | [] | [?@ != null] | []'
+    - name: csiAttrs
+      variable:
+        jmesPath: csiVolumes[?csi.driver=='connectors-csi'].csi.volumeAttributes
+    - name: singleRefs
+      variable:
+        jmesPath: csiAttrs[?"connector.name" != null].join('/', ["connector.namespace" || '{{request.namespace}}', "connector.name"])
+    - name: rawPluralRefs
+      variable:
+        jmesPath: csiAttrs[?connectors != null].connectors | join(',', @) | split(@, ',')
+    - name: pluralRefs
+      variable:
+        jmesPath: "rawPluralRefs | map(&trim(@, ' \t\n\r'), @) | [?@ != ''] | map(&(contains(@, '/') && @ || join('/', ['{{request.namespace}}', @])), @)"
+    - name: mountsProductionConnector
+      variable:
+        jmesPath: contains([singleRefs, pluralRefs] | [] | [?@ != ''], '<production-connector>')
+    - name: mappings
+      variable:
+        jmesPath: (request.object.spec.params || `[]`)[?name=='imageMappings'].value | [0] || `[]`
+    - name: mappingsForEach
+      variable:
+        jmesPath: to_array(mappings)
+    - name: mappingsIsList
+      variable:
+        jmesPath: type(mappings) == 'array'
+    - name: malformed
+      variable:
+        jmesPath: "to_array(mappings)[?length(split(@, ' ')) != `2` || contains(@, '\n') || contains(@, '\t') || contains(@, '\r')]"
+    - name: approvedSourceTagPatterns
+      variable:
+        value:
+        - '<approved-source-tag-pattern>'
+        - '^sha256-[0-9a-f]{64}\.(sig|att|sbom)$'
+    preconditions:
+      all:
+      - key: '{{ mountsProductionConnector }}'
+        operator: Equals
+        value: true
+    validate:
+      failureAction: Enforce
+      message: 'Promotion content refused: imageMappings must be a non-empty list of single-line "SRC DST" pairs whose sources come from an approved registry and are release artifacts (digest or release tag), and whose destinations land in an approved registry under the same repository path. isList={{ mappingsIsList }} count={{ length(mappings) }} malformed={{ length(malformed) }} mappings={{ mappings }}.'
+      foreach:
+      - list: '`[1]`'
+        deny:
+          conditions:
+            any:
+            - key: '{{ mappingsIsList }}'
+              operator: Equals
+              value: false
+            - key: '{{ length(mappings) }}'
+              operator: Equals
+              value: 0
+            - key: '{{ length(malformed) }}'
+              operator: GreaterThan
+              value: 0
+      - list: mappingsForEach
+        context:
+        - name: src
+          variable:
+            jmesPath: split(element, ' ') | [0] || ''
+        - name: dst
+          variable:
+            jmesPath: split(element, ' ') | [1] || ''
+        - name: srcRepo
+          variable:
+            jmesPath: split(element, ' ') | [0] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @) | split(@, '@') | [0] | split(@, ':') | [0]
+        - name: dstRepo
+          variable:
+            jmesPath: split(element, ' ') | [1] | split(@, '://') | [1] || '' | split(@, '/') | [1:] | join('/', @) | split(@, '@') | [0] | split(@, ':') | [0]
+        - name: repoMismatch
+          variable:
+            jmesPath: srcRepo != dstRepo
+        - name: hasRepositoryPath
+          variable:
+            jmesPath: contains(split(src, '//') | [-1] || '', '/')
+        - name: lastSegment
+          variable:
+            jmesPath: split(src, '/') | [-1] || ''
+        - name: repositoryName
+          variable:
+            jmesPath: split(split(lastSegment, '@') | [0] || '', ':') | [0] || ''
+        - name: digestPinned
+          variable:
+            jmesPath: regex_match('@sha256:[0-9a-f]{64}$', lastSegment)
+        - name: tag
+          variable:
+            jmesPath: contains(lastSegment, ':') && (split(lastSegment, ':') | [-1]) || ''
+        - name: tagApproved
+          variable:
+            jmesPath: tag != '' && regex_match(join('|', map(&join('', ['(', @, ')']), approvedSourceTagPatterns)), tag)
+        deny:
+          conditions:
+            any:
+            - key: '{{ src }}'
+              operator: AllNotIn
+              value:
+              - docker://<approved-source-registry>/*
+            - key: '{{ dst }}'
+              operator: AllNotIn
+              value:
+              - docker://<approved-target-registry>/*
+            - key: '{{ repoMismatch }}'
+              operator: Equals
+              value: true
+            - key: '{{ hasRepositoryPath }}'
+              operator: Equals
+              value: false
+            - key: '{{ repositoryName }}'
+              operator: Equals
+              value: ''
+            - key: '{{ digestPinned || tagApproved }}'
+              operator: Equals
+              value: false
+```
+
+:::
+
+Beyond these, Kyverno's CEL-based `ValidatingPolicy` (`policies.kyverno.io/v1alpha1`) is the
+shape that offers both: `variables` computed once per request and shared by every entry in
+`validations`, each with its own message. It is a rewrite of every rule into CEL rather than
+a rearrangement, so this guide does not go there; see [Limits](#limits).
+
+### Tightening a namespace with `Policy` \{#namespace-policy}
+
+The cluster-wide set is the platform's **baseline**; teams differ, and a namespace is free to
+be *stricter* than the baseline without asking the platform to change it. That is what
+Kyverno's namespaced `Policy` kind is for: the rule syntax is identical to `ClusterPolicy`,
+but the object lives in a namespace, evaluates only that namespace's requests, and is managed
+by the namespace's owners — no cluster-wide permissions involved. Copy any run rule from this
+guide into a `Policy`, give it tighter values (a shorter approver list, a single approved
+source), and apply it in the namespace. Layering is safe by construction: every matching rule
+of every policy must pass, so an added `Policy` only ever tightens — it cannot loosen the
+baseline, and there is no precedence to reason about.
+
+This guide stops here on purpose. The two-tier model — a platform baseline as `ClusterPolicy`
+plus per-project tightening as `Policy`, including how to scope the baseline safely and why
+it must not depend on namespace labels — is worked out with examples in
+[Pipeline Policy Constraints with Tekton and Kyverno](https://cloud.alauda.io/kb#/solutions/Pipeline_Policy_Constraints_with_Tekton_and_Kyverno.html).
+
+## Applying and Verifying \{#applying-and-verifying}
+
+Verify in **both** directions: a gate that has only been tested against violations is
+half tested — the case that breaks a release is the compliant promotion that gets rejected, and
+the case that breaks everyone else is the ordinary copy that gets caught.
+
+### Quick check: one denial, one admission \{#quick-check}
+
+Both checks use server-side dry run — admission is evaluated for real, nothing is created.
+First the direction that must fail: the same run your promotion pipeline produces, except that
+it names a `Pipeline` that is not a promotion template. Replace the placeholders (the
+[table above](#placeholders-to-replace)) and run it as one block:
+
+Replace in this block: `<pipeline-namespace>`, `<approved-source-registry>`, `<approved-target-registry>`, `<connector-namespace>`, `<connector-name>`.
+
+```bash
+kubectl create --dry-run=server -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: guardrail-smoke-
+  namespace: <pipeline-namespace>
+spec:
+  pipelineRef:
+    name: nightly-mirror        # deliberately not one of the promotion templates
+  params:
+    - name: imageMappings
+      value:
+        - "docker://<approved-source-registry>/team/app:1.2.3 docker://<approved-target-registry>/team/app:1.2.3"
+  workspaces:
+    - name: src-registry-config
+      secret:
+        secretName: src-registry-config
+    - name: dst-registry-config
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.namespace: <connector-namespace>
+          connector.name: <connector-name>
+          configuration.names: registry-config
+YAML
+# Expect: the request is refused, and the message names promotion-runs-use-a-template.
+```
+
+Then the direction that must succeed — the identical request, with `pipelineRef.name` changed
+to your promotion template (`<promotion-pipeline>`). With the catalog variants deployed,
+reference the template the way your runs do instead — `resolver: hub` with the `catalog`,
+`kind` and `name` params in place of `pipelineRef.name`. Either way the template need not exist
+as a local `Pipeline` for this check: admission judges the reference, and Tekton resolves it
+only when the run actually starts.
+
+Replace in this block: `<pipeline-namespace>`, `<promotion-pipeline>`, `<approved-source-registry>`, `<approved-target-registry>`, `<connector-namespace>`, `<connector-name>`.
+
+```bash
+kubectl create --dry-run=server -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  generateName: guardrail-smoke-
+  namespace: <pipeline-namespace>
+spec:
+  pipelineRef:
+    name: <promotion-pipeline>
+  params:
+    - name: imageMappings
+      value:
+        - "docker://<approved-source-registry>/team/app:1.2.3 docker://<approved-target-registry>/team/app:1.2.3"
+  workspaces:
+    - name: src-registry-config
+      secret:
+        secretName: src-registry-config
+    - name: dst-registry-config
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.namespace: <connector-namespace>
+          connector.name: <connector-name>
+          configuration.names: registry-config
+YAML
+# Expect: "created (server dry run)" — a compliant promotion is admitted.
+```
+
+A refusal here means a placeholder does not match your environment — most often the template
+name, the registry hosts, or the Connector coordinates; with rule 11 deployed under your own
+pattern list, also the example's `1.2.3` tag, which must match a pattern. The refusal message names the rule
+that objected; [Troubleshooting](#troubleshooting) maps each rule to its usual cause.
+
+### Check it against a real promotion run \{#real-run}
+
+Everything above is synthetic: it proves the rules work on requests **this page** wrote. It does
+not prove they match the requests **your pipeline** produces — and a mismatch there is silent,
+because a rule whose precondition never fires produces neither a denial nor a report entry.
+Close that gap before trusting the policies.
+
+Start a real promotion with a template and the Connector and let it finish. Then run the
+script below; every check prints `PASS` or `FAIL` and the script exits non-zero when any
+failed. Check 2 needs `skopeo` and read access to the source registry from where you run it;
+checks 1, 2 and 4 need `jq`. Check 3 asserts `success=1`, the Task's count of copied mappings:
+adjust it when a run carries several. When you save it, copy the body of the block only — not
+the surrounding triple-backtick fence lines, since a stray backtick run in a shell file opens a
+command substitution that swallows the rest of the script.
+
+Check 1 reads `PolicyReport` objects, which the reports controller writes **after** admission,
+on its own schedule. Run the script immediately after the run finishes and check 1 can list
+the `PipelineRun` rules but not yet the `TaskRun` or Pod ones, which reads as a failure that
+is only a race — give the reports a moment and run it again before investigating.
+
+:::details Post-run verification script (four checks, copy-paste ready)
+
+Replace in this block: `<pipeline-namespace>`, `<promotion-pipeline>`, `<production-connector>`, and
+`SRC_TLS_VERIFY` when the source registry is self-signed.
+
+```bash
+#!/usr/bin/env bash
+# Four checks against the newest promotion run. Each prints PASS or FAIL; the script exits
+# non-zero if any failed.
+set -uo pipefail
+NS=<pipeline-namespace>
+SRC_TLS_VERIFY=true   # set to false for a self-signed source registry, as the run's srcTLSVerify parameter does
+pass=0; fail=0
+verdict() { if [ "$1" -eq 0 ]; then echo "PASS $2"; pass=$((pass+1)); else echo "FAIL $2: $3"; fail=$((fail+1)); fi; }
+
+# The newest run that references the template -- by name, or through the `name` parameter of the
+# catalog variant's hub reference. Not the tekton.dev/pipeline label: Tekton derives that from
+# the run's own name when the pipeline is inline, so it can be worn by a run that is not a
+# promotion.
+PR="$(kubectl get pipelinerun -n "$NS" -o json | jq -r '
+  [ .items[] | select(
+      (.spec.pipelineRef.name
+        // ((.spec.pipelineRef.params // []) | map(select(.name == "name")) | .[0].value // ""))
+      == "<promotion-pipeline>") ]
+  | sort_by(.metadata.creationTimestamp) | last | .metadata.name // empty')"
+test -n "$PR" || { echo "no promotion run found in $NS"; exit 1; }
+# The join key is the controlling ownerReference, not the tekton.dev/pipelineRun label: that
+# label is one of the labels taskRunSpecs[].metadata.labels lets a run's author overwrite, so it
+# can name another run. The pipelineTask label is only used to choose among the run's own
+# children, which the owner reference has already narrowed the list to.
+PR_UID="$(kubectl get pipelinerun -n "$NS" "$PR" -o jsonpath='{.metadata.uid}')"
+TR="$(kubectl get taskrun -n "$NS" -o json | jq -r --arg uid "$PR_UID" '
+  .items[]
+  | select(any(.metadata.ownerReferences[]?;
+      .controller == true and .kind == "PipelineRun" and .uid == $uid))
+  | select(.metadata.labels["tekton.dev/pipelineTask"] == "promote-images")
+  | .metadata.name')"
+POD="$(kubectl get taskrun -n "$NS" "$TR" -o jsonpath='{.status.podName}')"
+
+# 1. All three objects were evaluated: the seven PipelineRun rules on the run, the TaskRun rule on
+#    its TaskRun and the Pod rule on its Pod, every one of them "pass" -- each attributed to its own policy. A short list
+#    right after the run usually means the reports controller has not written that object's
+#    report yet: run the script again before reading it as a finding.
+#    Rule 2's owner-reference rule is left out on purpose: it also matches the controller's later
+#    updates of the TaskRun, which add no reference and are recorded as skip, so its row is not stable.
+#    If it stays short, a policy did not see the run: recheck the Connector reference in its
+#    workspaces against <production-connector>, and drop the rules you chose not to deploy
+#    from the jq list and the expected string.
+reported="$(kubectl get policyreport -n "$NS" -o json | jq -r --arg pr "$PR" --arg tr "$TR" --arg pod "$POD" '
+  [ .items[] | select(.scope.name == $pr or .scope.name == $tr or .scope.name == $pod)
+    | .scope.kind as $k | .results[]
+    | select(.rule != "taskrun-owner-references-set-by-the-controller")
+    | select([.policy] | inside(["promotion-runs-use-a-template","no-taskrun-outside-a-template",
+        "no-pod-outside-a-template","promotion-approvers","sources-from-approved-registries",
+        "targets-in-approved-registries","mapping-shape","target-path-matches-source",
+        "sources-carry-release-tags"]))
+    | "\($k)/\(.rule)=\(.result)" ] | sort | join(" ")')"
+expected="PipelineRun/mapping-shape=pass PipelineRun/promotion-runs-use-a-template=pass PipelineRun/run-approvers-from-the-allowed-list=pass PipelineRun/sources-carry-release-tags=pass PipelineRun/sources-from-approved-registries=pass PipelineRun/target-path-matches-source=pass PipelineRun/targets-in-approved-registries=pass Pod/no-pod-outside-a-template=pass TaskRun/no-taskrun-outside-a-template=pass"
+[ "$reported" = "$expected" ]; verdict $? "rules-evaluated-on-real-run" "got: ${reported:-nothing}"
+
+# 2. For every mapping, the digest the Task reports at the destination equals the source's
+#    current digest. The array result dst-image-urls lists each destination as url@digest (older
+#    Tekton versions deliver it as a JSON string; both are handled). Two caveats: results are
+#    size-limited by Tekton, so a run with enough mappings truncates dst-image-urls and this
+#    check would report a false failure -- inspect those destinations directly instead; and a
+#    tag-based source is read as it is NOW, so this proves the destination matches the source's
+#    current content, not that nothing changed since the promotion. Promote by digest (the source
+#    reference is repo@sha256:...) and the comparison is exact and immutable.
+while read -r src dst; do
+  reported="$(kubectl get taskrun -n "$NS" "$TR" -o json \
+    | jq -r --arg d "${dst#docker://}" '.status.results[] | select(.name=="dst-image-urls") | .value
+        | (if type == "string" then fromjson else . end)[] | select(startswith($d + "@")) | sub("^.*@"; "")')"
+  expected="$(skopeo inspect --tls-verify="$SRC_TLS_VERIFY" --format '{{.Digest}}' "$src")"
+  [ -n "$reported" ] && [ "$reported" = "$expected" ]; verdict $? "digest-preserved $dst" "source=$expected reported=${reported:-none}"
+done < <(kubectl get pipelinerun -n "$NS" "$PR" -o json | jq -r '.spec.params[] | select(.name=="imageMappings") | .value[]')
+
+# 3. The copy went through the Connector. By construction the mount carries proxy settings, not
+#    a registry password (see What Counts as a Promotion); this check does not re-prove that, it
+#    confirms the step loaded those settings and the Task counted the copy as successful. A push
+#    that succeeds with no password in the Pod is only possible if the proxy injected the
+#    credential -- so checks 2 and 3 together are the evidence, not the log line alone.
+LOG="$(kubectl logs -n "$NS" "$POD" -c step-copy-images)"
+grep -q 'Loading env config: /workspace/dst-registry-config/.env' <<<"$LOG" \
+  && grep -q 'HTTPS_PROXY set' <<<"$LOG" && grep -q 'success=1' <<<"$LOG"
+verdict $? "copied-through-connector-proxy" "expected .env loaded, HTTPS_PROXY set and success=1 in the step log"
+
+# 4. The rules actually see such a request: the same run with its destination repository renamed
+#    must be denied, by the parity rule, when submitted as a dry run. Capture first, then inspect:
+#    the denial's non-zero exit must not mask the match.
+kubectl get pipelinerun -n "$NS" "$PR" -o json \
+  | jq 'del(.metadata.name, .metadata.uid, .metadata.resourceVersion, .metadata.creationTimestamp,
+            .metadata.generation, .metadata.managedFields, .metadata.labels, .metadata.annotations, .status)
+        | .metadata.generateName = "policy-acceptance-"
+        | .spec.params = [ .spec.params[]
+            | if .name == "imageMappings"
+              then .value = [ (.value[0] | split(" ")
+                    | .[0] + " " + (.[1] | sub("://(?<h>[^/]+)/"; "://\(.h)/renamed-by-acceptance-check/"))) ]
+              else . end ]' > /tmp/policy-acceptance.json
+DENIAL="$(kubectl create --dry-run=server -f /tmp/policy-acceptance.json 2>&1)" || true
+grep -q '^ *target-path-matches-source:' <<<"$DENIAL"; verdict $? "renamed-copy-denied" "the policy does not match your runs"
+
+echo "== result: $pass pass / $fail fail =="
+[ "$fail" -eq 0 ]
+```
+
+:::
+
+Checks 2 and 3 are also where the two consequences listed under
+[What Counts as a Promotion](#what-counts) become reproducible: the digest equality is check 2,
+and the proxy routing is check 3.
+
+### Rolling out, and rolling back \{#rollout}
+
+To observe before enforcing, set `validate.failureAction` to `Audit` on the rules you are
+introducing, run real promotions, and read the resulting `PolicyReport` objects:
+
+Replace in this block: `<pipeline-namespace>`.
+
+```bash
+# Switch every guardrail to Audit at once: every rule of every object, so it also covers
+# the second rules of rules 2 and 5 and any bundle built as in Composing.
+for p in $(kubectl get clusterpolicy -l app.kubernetes.io/part-of=promotion-guardrails -o name); do
+  n=$(kubectl get "$p" -o jsonpath='{.spec.rules[*].name}' | wc -w)
+  for i in $(seq 0 $((n - 1))); do
+    kubectl patch "$p" --type=json \
+      -p "[{\"op\":\"replace\",\"path\":\"/spec/rules/$i/validate/failureAction\",\"value\":\"Audit\"}]"
+  done
+done
+
+# One report per evaluated resource, named after its UID; the columns count results. Expect one
+# pass row per guardrail rule that matched -- seven for the PipelineRun, one each for the TaskRun
+# and the Pod -- while the PASS/SKIP totals can be larger on a cluster where other Kyverno
+# policies also match these kinds. The rows below are illustrative; your totals may differ.
+kubectl get policyreport -n <pipeline-namespace>
+# NAME                                   KIND          NAME                     PASS   FAIL   ...
+# 78738908-3ac3-47db-abd3-3bc4a6fe2794   PipelineRun   promote-run-x9k2         7      0
+# 1f0c5a2e-7b4d-4e0f-9c6a-2d8e3b5f7a91   Pod           promote-run-x9k2-promote-images-pod   1   0
+
+# Which policy and rule produced each result.
+kubectl get policyreport -n <pipeline-namespace> \
+  -o jsonpath='{range .items[*].results[*]}{.policy}{"\t"}{.rule}{"\t"}{.result}{"\n"}{end}'
+```
+
+Reports are attached to the evaluated object: deleting the run deletes its report. The run rules
+match `CREATE` only and the policies run with `background: false`, so a run that already existed
+when a policy was installed is never evaluated and never appears in a report. It cannot be
+judged later either, and nothing needs it to be: Tekton's own validation refuses every change
+to a run's `spec` other than the `status` control field used to cancel it or release a pending
+one — whether or not the run has started. A run created with `spec.status: PipelineRunPending`
+is the case to be sure about, since it sits unstarted for as long as someone wants: verified,
+its mappings could not be rewritten while pending (`Once the PipelineRun has started, only
+status updates are allowed`, from Tekton's webhook, even though the run had no start time), and
+releasing it was accepted. So what a run was admitted
+with is what it runs with. That matters for one kind of run: a promotion that predates the set
+and is still waiting at its approval task. Once approved, it produces a `TaskRun` and a Pod that
+rules 2 and 3 accept, because its parent does reference a template —
+while its mappings and pod template were never checked by rules 1 and 5 to 11. Drain those runs
+when the set is installed: list what is still in progress, and cancel and recreate anything you
+would not have admitted.
+
+Replace in this block: `<pipeline-namespace>`, `<run>`.
+
+```bash
+# Every promotion run still in progress. The ones to drain are those whose creationTimestamp
+# is earlier than the moment the policies were applied.
+kubectl get pipelinerun -n <pipeline-namespace> -o json | jq -r '
+  .items[] | select(.status.conditions[0].status == "Unknown")
+  | [.metadata.name, .metadata.creationTimestamp,
+     (.spec.pipelineRef.name
+       // ((.spec.pipelineRef.params // []) | map(select(.name == "name")) | .[0].value)
+       // "inline")] | @tsv'
+# Cancel one you would not have admitted; recreate it once the set is in place.
+kubectl patch pipelinerun <run> -n <pipeline-namespace> --type=merge -p '{"spec":{"status":"CancelledRunFinally"}}'
+# Anything else already holding a Connector mount -- a TaskRun created directly, or a Pod that
+# belongs to no run -- was never judged by rules 2 and 3 either. Delete what you would not
+# have admitted; the third column is the parent run read from the controlling ownerReference --
+# not from the tekton.dev/pipelineRun label, which a run's author can overwrite -- or "none".
+kubectl get pods,taskruns -n <pipeline-namespace> -o json | jq -r '
+  .items[] | select([.. | objects | select(.driver? == "connectors-csi")] | length > 0)
+  | [.kind, .metadata.name,
+     ((.metadata.ownerReferences // [])
+       | map(select(.controller == true and .kind == "PipelineRun")) | .[0].name // "none")] | @tsv'
+
+# A TaskRun that carries no Connector mount of its own is not in the list above, and the owner
+# rule never judged it either if it predates the apply: that rule also runs with
+# background: false, so the chain rule 3 walks when the controller creates that TaskRun's Pod --
+# after a controller backlog, or a restart during the rollout -- was never checked. Drain the
+# ones created before the apply time together with the runs they name.
+kubectl get taskrun -n <pipeline-namespace> -o json | jq -r '
+  .items[] | select(.status.conditions[0].status == "Unknown")
+  | (((.metadata.ownerReferences // [])
+       | map(select(.controller == true and .kind == "PipelineRun")) | .[0].name)) as $parent
+  | select($parent != null)
+  | [.metadata.name, .metadata.creationTimestamp, $parent] | @tsv'
+```
+
+Templates are different. A `Pipeline` is mutable and long-lived, and one that predates the
+policies is a real blind spot: rule 5's template side never rescans it, rule 1 admits runs that
+reference it by name, and `allowExistingViolations: false` only catches it on its next edit —
+until someone edits it, an unlisted approver baked into an old template keeps receiving
+approval requests. Audit the namespace once when the set is installed:
+
+Replace in this block: `<pipeline-namespace>`.
+
+```bash
+# Every ApprovalTask approver named by every Pipeline in the namespace, one row per value.
+kubectl get pipeline -n <pipeline-namespace> -o json | jq -r '
+  .items[] | . as $p
+  | [(.spec.tasks // [])[], (.spec.finally // [])[]]
+  | .[] | select(.taskRef.kind == "ApprovalTask")
+  | (.params // [])[] | select(.name == "approvers")
+  | .value | (if type == "array" then .[] else . end)
+  | [$p.metadata.name, .] | @tsv'
+# Any name outside the allowed list: have a maintainer fix that template. The edit itself is
+# the moment rule 5 starts judging it.
+```
+
+An empty report is ambiguous: it means "nothing violated" **and** "nothing matched". Check 1 of
+the real-run section tells the two apart — it counts the rules that reported on a specific run —
+so run it before deciding the observation window was clean, then switch the rules back to
+`Enforce` (the same loop, with the value flipped) and re-read the per-rule action listed under
+[Composing the Rules](#composing).
+
+Because the set is fail-closed, plan the way out before you need it. Deleting the policies is
+the fastest unblock and takes effect immediately — and the label makes it one command:
+
+```bash
+# Emergency: stop the guardrails from blocking promotions.
+kubectl delete clusterpolicy -l app.kubernetes.io/part-of=promotion-guardrails
+
+# Softer alternative: the Audit loop above keeps the reporting and stops the blocking.
+# A namespace's own stricter Policy objects, if any, are that namespace's to remove.
+```
+
+Neither step revives a run that was already rejected: admission happened once, at creation, so
+the run has to be created again after the change. Re-applying the version-controlled file
+restores the set as it was.
+
+## Who May Approve \{#approval}
+
+Kyverno does not perform approvals. Who may approve a promotion is decided in two places, and
+the recommended shape needs only the first:
+
+- **The template names the approvers — and the approval gate enforces them.** The promotion
+  page pins `approvers` and `numberOfApprovalsRequired` inside the `Pipeline`. The manual
+  approval gate's own admission webhook accepts a response to the `ApprovalTask` only from an
+  identity on that list — a named user acting as themselves, or a member of a named group —
+  and only for that identity's own entry; anyone else's update is refused. So the list in the
+  template *is* the approval policy, and the guardrails exist to keep it intact: rule 4 keeps
+  the template from being edited by non-maintainers, rule 5 keeps even a maintainer's edit
+  inside `allowedApprovers`, and rules 1, 2 and 3 make a run of the template the only thing
+  that can hold the production credential — a run that skipped the approval step cannot reach
+  production because nothing lets it mount the Connector. A template may instead take
+  `approvers` as a run parameter — a variant for teams whose promotions genuinely need per-run
+  approvers — and rule 5 is what makes that variant safe: literal, default and run-supplied
+  values alike are checked before the run exists.
+- **Optionally, the Connector withholds the credential until that approval is recorded.** An
+  `AccessPolicy` on the production Connector can make the driver release the mount only after
+  the built-in check `connectors-approvals-in-pipeline` finds the `ApprovalTask` carrying the
+  requesting Pod's `tekton.dev/pipelineRun` label approved — by at least
+  `numberOfApprovalsRequired` distinct identities from the `approvers` the policy itself names,
+  when those parameters are set; a group is written with the `group:` prefix, and every
+  approving member counts individually. That moves enforcement to the moment the credential
+  is handed out — but not on its own: the check identifies the run through the requesting
+  Pod's `tekton.dev/pipelineRun` label, and a label is whatever the Pod's creator wrote. With
+  rules 2 and 3 absent, any Pod in the namespace could carry an approved run's label and
+  borrow the credential while that approval stands — a Pod written by hand, or one the
+  controller created for a run whose `taskRunSpecs[].metadata.labels` named the approved run.
+  The gate adds *who may approve* on the credential's side; rules 2 and 3 remain what ties the
+  credential to the approved run's own Pods, and they read owner references, not labels — each
+  hop matched by `uid` as well as by name, so a renamed reference resolves to no parent.
+  It is not a second approval — the check reads the same `ApprovalTask`'s recorded responses,
+  and the `AccessRequest` it produces is created and resolved automatically. It costs two
+  **cluster-wide** feature flags that change the behavior of every Connector on the cluster;
+  the promotion page's
+  [Optional: release the credential only after approval](./promote_artifacts_with_skopeo_copy.mdx#connector-approval)
+  weighs that and sets the layer up end to end.
+
+Which shape to pick:
+
+- **Default — template approvers, protected by rules 4 and 5.** No cluster-wide change, one
+  list to maintain. Everything else on this page assumes this shape.
+- **Add the `AccessPolicy` layer** when the credential's owners are not the pipeline's owners —
+  platform or security administrators own the production Connector, application teams own the
+  pipelines — and the cluster already runs with the Connectors approval flags on, or is
+  prepared to enable them for every Connector. Name the identities in the policy; the
+  administrators then keep the final say regardless of what the template names. When one team
+  owns both, use the policy *without* the `approvers` parameter: any approval of the run's
+  `ApprovalTask` releases the credential, and the template's list stays the only one to keep.
+
+With the layer on, the promotion page records the verified runtime behavior: a pending
+approval keeps the copy Pod waiting at volume mount; an approval by someone outside the
+policy's list fails the check with `ApproverMismatch` and the Pod gets an `.error.json` marker
+instead of configuration, failing the step promptly; a rejection stops the pipeline at the
+approval task. An `AccessPolicy` of that shape, naming the specific identities whose approval
+releases the production credential:
+
+Replace in this block: `<connector-namespace>`, `<connector-name>`, `<allowed-approver>`.
+
+```yaml
+apiVersion: connectors.alauda.io/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: production-registry-approval
+  namespace: <connector-namespace>
+spec:
+  connector:
+    names:
+      - <connector-name>
+  checkGrantedPermission:
+    spec:
+      checks:
+        - name: manual-approval
+          ref:
+            configMap:
+              name: connectors-approvals-in-pipeline
+          params:
+            # One entry per identity; keep it identical to the template's approvers list.
+            - name: approvers
+              value:
+                - <allowed-approver>
+            - name: numberOfApprovalsRequired
+              value: "1"
+      roleTemplate:
+        ref:
+          configMap:
+            name: connectors-use-connectors-proxy-in-pod
+```
+
+The two referenced ConfigMaps are installed by Alauda DevOps Connectors in its own system
+namespace; both `ref`s must point there. Approval-gated access requires the
+`enable-connectors-approval` and `enable-connector-proxy-permissions` feature flags — the
+promotion page shows how to enable them, and
+<ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_approval.html" children="Connectors Approval & Permission Gating" />
+covers keeping existing Connector consumers working across the flip; confirm they are on
+before relying on this layer:
+
+```bash
+kubectl get connectorscore -A \
+  -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.featureFlags.enable-connectors-approval}{" "}{.spec.featureFlags.enable-connector-proxy-permissions}{"\n"}{end}'
+```
+
+With the flags off — the default — the `AccessPolicy` webhook refuses to create policies at
+all, and the template's list, protected by rules 4 and 5, is the whole approval policy. With
+them on, two contracts keep the layers consistent, and both were confirmed by running real
+promotions against a real Connector:
+
+- **Every identity the `AccessPolicy` names must also be on the template's approver
+  surface — and the recommended default is to make the two lists identical.** The check
+  reads the `ApprovalTask`'s recorded responses, and those mirror the template's approver
+  entries: a username in the policy is satisfied only by that user approving as themselves,
+  and a `group:` entry only by members of that same group approving through it. An approval
+  through an entry the policy does not name — however legitimate on the pipeline side —
+  leaves the check at `ApproverMismatch` and the credential withheld. That is why a template
+  surface *wider* than the policy is a trap, not a convenience: with
+  `numberOfApprovalsRequired: "1"`, the first response completes the `ApprovalTask`, so a
+  well-meaning approval by someone on the template's list but outside the policy's fails the
+  run outright (observed live: pipeline approved, check `ApproverMismatch`, copy step failed)
+  — it does not wait for the right person. Keep the lists identical and the mismatch cannot
+  happen by accident; `ApproverMismatch` then only ever signals tampering. Widen the
+  template beyond the policy only when the template collects several approvals per run (its
+  `numberOfApprovalsRequired` above 1, so a policy-named identity can still respond after
+  the others) — and even then, a run signed off exclusively by the extra identities fails.
+- **Rule 5's `allowedApprovers` must cover the template surface, policy identities
+  included.** The same identities then appear in three places with a fixed relationship:
+  the template's `approvers` (who is asked) is a subset of rule 5's `allowedApprovers`
+  (who may be named at all), and the `AccessPolicy`'s `approvers` (whose response releases
+  the credential) is a subset of the template's. Rule 5 mechanically ties the first pair;
+  the `AccessPolicy` is the Connector's own object, so tie the second by review. If the
+  policy demands identities or counts the template cannot deliver, every run fails at the
+  copy step with `ApproverMismatch` — visible on the `AccessRequest`, not a hang.
+
+One more shape came out of live testing: a pipeline with **no** `ApprovalTask` at all,
+leaning on the Connector alone. It does not work with the built-in kit — the check matches
+`ApprovalTask` objects by the run's label, and hand-created ones are never reconciled by the
+approval controller, so the request stays `Pending` until the run times out. The
+`AccessPolicy` check mechanism is generic (a custom check template can match other objects),
+but with the built-in templates the `ApprovalTask` in the pipeline remains the supported
+interaction point — keep it.
+
+## Limits \{#limits}
+
+The policies judge **what the request declares**, at the moment it is created. Everything below
+is outside their reach and must be handled elsewhere:
+
+- **The convention is the anchor.** Every guarantee above rests on the production credential
+  existing *only* as the Connector. A `dockerconfigjson` Secret for the production registry, in
+  any namespace, is a promotion path the policies never see. Search for such Secrets before
+  relying on the guardrails, and bound who may create them.
+- **The templates' contract is the policies' contract.** Rules 6 to 9 and 11 read `imageMappings`, and
+  rule 5 reads `approvers`, because those are the inputs the templates expose. Rule 10 refuses
+  the edit that would widen the copy step's surface — `srcImage`, `dstImages`, the
+  `copy-mappings` workspace, `skopeoImage`, `extraCopyArgs` or anything newer; widening it for
+  real needs the new input reviewed into rule 10's lists *and* a matching rule. A template that
+  changes the Task reference still needs the change reviewed: rule 4 makes sure such changes go
+  through maintainers, not that they are safe.
+- **The catalog variant trusts the catalog — and the hub endpoint.** With the variant of rule 1,
+  template content is whatever the trusted catalog serves under the pinned names — including
+  newer versions, since the version parameter is not compared. Where that is too loose, extend
+  the variant's comparison with the `version` resolver parameter, and treat catalog publishing
+  rights as what rule 4 is for namespace-local templates. The variant refuses the two resolver
+  parameters that would fetch the pinned names from another hub (`url`, and a `type` other than
+  `artifact`), which leaves the cluster-configured endpoint in `hubresolver-config` as the trust
+  root: an identity that can change it needs no bypass, the approved coordinates simply resolve
+  elsewhere. Control write access to that configuration as you control `ClusterPolicy`.
+- **The destination artifact does not exist yet.** Admission can inspect references, never the
+  content the copy is about to produce. Properties of the promoted artifact can only be checked
+  after it lands, by the consuming side.
+- **Validating the source artifact's own attributes is not included.** Rules that read image
+  labels or other content need Kyverno itself to reach the registry (`context.imageRegistry`),
+  and they fail **closed**: when the registry cannot be read, the rule errors and every matching
+  promotion is rejected. The failure is not hypothetical. In one environment every such rule was
+  refused with
+  `invalid realm in www-authenticate: realm host "192.0.2.10" is a private or link-local address`
+  even though the registry was reachable and readable — Kyverno's registry client rejected the
+  token realm because its host was a private IP literal, a guard that later versions relax when
+  the realm host equals the registry host. So whether these rules work is a property of **your
+  Kyverno build**, not only of your registry: before designing anything around image-attribute
+  rules, apply one trial rule and watch it succeed. Treat such rules as a separate project with
+  their own connectivity and credential design, not as a line to add to this set.
+- **The parity rule compares repositories, not tags.** By design, promoting `app:1.2.3` to
+  `app:stable` is allowed; what is forbidden is landing in a different repository. Teams that
+  also forbid retagging must apply the stricter variant. Which *builds* may be promoted at all
+  is rule 11's question — without it, `app:latest` promotes as readily as `app:1.2.3`.
+- **TLS verification stays a run-time input.** `srcTLSVerify` and `dstTLSVerify` are exposed by
+  the template and not constrained here: they change how the copy trusts an endpoint, not which
+  endpoint it writes to. With the Connector in the path, the destination connection presents the
+  Connectors CA while the source one is tunnelled through and presents its own, and the promotion
+  page's template answers that by exposing the Task's `src-ca-bundle` / `dst-ca-bundle`
+  workspaces for a run to bind — the destination one to the mount holding that `ca.crt`, the
+  source one to the site's own CA where its source registry needs it. Rule 10 lists both names,
+  so adopting it needs no review. A run may still set either switch to `"false"`; if your policy
+  forbids weakening them, add a rule on those two parameters.
+- **The controller identity is trusted.** Rules 2 and 3 accept a `TaskRun` or a Pod because
+  the Tekton controller created it for a run of a template, and they find that run through the
+  owner references the controller writes — by name *and* by `uid`, so an object found under the
+  referenced name that is not the referenced object is no parent. Whoever can act as that
+  service account — or can create `TaskRun`s or Pods through some other controller running with
+  it — is inside the trust boundary. Labels are not: `taskRunSpecs[].metadata.labels` lets a run's author choose the
+  `tekton.dev/*` labels of its children, which is why no rule here reads one.
+- **A running promotion Pod can be read by whoever may reach it.** The policies judge creation.
+  Anyone allowed to `exec` into, or attach an ephemeral container to, Pods in
+  `<pipeline-namespace>` can read the mounted token and proxy settings while the copy step
+  runs — an RBAC boundary of that namespace, not something admission can close.
+- **Outside these policies, the mount is governed by RBAC alone.** With the Connectors approval
+  flags off — the default — the driver mounts the Connector for any Pod whose service account
+  may `get` it, and the product grants that to every service account in the Connector's scope:
+  its own namespace for an ordinary Connector, every namespace of the project for a
+  project-level one, the whole cluster for a cluster-level one in `kube-public`. Rule 3 is
+  what turns that into "only Tekton, only from a template"; without it, moving the credential
+  into a Connector removes the raw password from the namespace but not the ability to push
+  with it.
+- **Step overrides cannot change what runs.** `taskRunSpecs[].stepSpecs` (the `v1beta1`
+  `stepOverrides`, after conversion) carry only compute resources, so a run cannot swap the copy
+  step's image or command through them; they are left unconstrained.
+- **The pod-template check is a denylist.** Rule 1 refuses the five keys known to redirect
+  traffic or execution. A future Tekton or Kubernetes field with the same effect is not covered
+  until it is added to the list.
+- **One Connector, one namespace.** A `Connector` is a namespaced API object, and the
+  product's Connector levels are namespace conventions on top of it: a **cluster-level**
+  Connector lives in the designated shared namespace (`kube-public` in the Connectors
+  documentation) and is readable — and, without rule 3, mountable — cluster-wide, a project-level one in the project's namespace,
+  an ordinary one in its own. Every level is referenced the same way — an explicit
+  `namespace/name`; a bare name always resolves to the run's own namespace, never to the
+  shared one — so the pinned reference works for any level: a production Connector kept at
+  cluster level is pinned as `kube-public/<name>`. A same-named Connector in another
+  namespace is a different object that deliberately does not count. The precondition compares against the
+  single `<production-connector>`; a second production Connector is not evaluated at all until
+  every `mountsProductionConnector` variable is widened to a list of references. The
+  replacement below is written in terms of `singleRefs` and `pluralRefs`, the two variables
+  every rule's recognition preamble defines, so the same entry can be pasted over the
+  `mountsProductionConnector` entry of each rule you deploy — a form that names only
+  `connectorRefs` compiles, but fails to resolve in the rules that do not define it, and a
+  rule whose precondition errors rejects **every** matching request:
+
+  ```yaml
+  - name: mountsProductionConnector
+    variable:
+      jmesPath: "length([singleRefs, pluralRefs] | [] | [?@ != ''] | [?contains(['ns-a/prod-a', 'ns-b/prod-b'], @)]) > `0`"
+  ```
+
+  A run in a
+  namespace outside the `<pipeline-namespace>` list that mounts the Connector is rejected.
+  Promotions from several namespaces share one set — list every namespace in each rule — as
+  long as they share the template names and the approver and maintainer lists; a namespace
+  that needs its own lists takes a namespaced `Policy` instead
+  ([Tightening a namespace with `Policy`](#namespace-policy)). A new version of the Task is a
+  template change: re-read its parameter and result contract before adopting it.
+- **Kyverno's resource filters are outside the policies' reach.** By default Kyverno does not
+  evaluate requests in `kube-system`, `kube-public`, `kube-node-lease` and its own namespace
+  at all. A Pod, `TaskRun` or `PipelineRun` created there is never seen by any rule on this
+  page, whatever it mounts — creating workloads in those namespaces is an administrator's
+  privilege, and it stays one.
+- **`Audit` does not block anything.** It only records. A rule left in `Audit` after the
+  observation window is a rule that has been quietly turned off.
+- **"The submitter may not approve their own promotion" is not expressed here.** Separation of
+  duty requires correlating the run's originator with the approver, which neither the
+  `AccessPolicy` check nor rule 5 does — rule 5 bounds the set of names, not who responds.
+- **Shared context across rules is not a `ClusterPolicy` feature.** Each rule carries its own
+  `context`, so the Connector recognition preamble is repeated in each of the nine rule
+  entries that recognise the Connector; the ways to
+  reduce that are under [Bundling rules into fewer objects](#bundling). Kyverno's CEL-based
+  `ValidatingPolicy` computes `variables` once and shares them across attributed
+  `validations`, and its `image()` library parses registry, repository, tag and digest —
+  the natural next home for these rules, at the cost of rewriting them in CEL.
+- **Kyverno availability is part of the contract.** Every policy declares
+  `webhookConfiguration.failurePolicy: Fail`, so while Kyverno is unavailable, matching requests
+  are rejected rather than admitted unchecked. Because the run rules match every `PipelineRun`
+  and `TaskRun` creation on the cluster — cheaply, the precondition is a string comparison — an
+  outage stops *all* Tekton runs, not only promotions; and because rule 3 matches every Pod
+  creation, with it deployed an outage stops every Pod — and, through the generated controller
+  rules, every `Deployment`, `Job` and the like — on the whole cluster. Size the Kyverno
+  deployment accordingly. Narrowing rule 3's `match` to the namespaces that can reach the
+  Connector is a legitimate trade-off; it leaves a mount from an unlisted namespace to the
+  driver's own RBAC check, described two points up.
+- **Tekton's validation webhook is part of it too.** The run rules match `CREATE` only because
+  Tekton's own validating webhook refuses every change to a run's `spec` other than
+  `spec.status` ([Rolling out](#rollout)), so what a run was admitted with is what it runs
+  with. That premise rests in turn on that webhook being `failurePolicy: Fail`: while it is
+  unavailable, `PipelineRun` updates are rejected by the API server, not admitted unchecked.
+  Weakening or removing its webhook configuration is a cluster administrator's act, outside
+  this page's model.
+
+## Troubleshooting \{#troubleshooting}
+
+- **A compliant promotion is rejected.** Read the denial message: it names the policy and rule
+  and prints the offending values. The most common causes are a placeholder that was not
+  replaced everywhere, a Connector reference that differs from `<production-connector>` in
+  namespace, and template lists that drifted apart between rules 1, 2, 3 and 4.
+- **An ordinary copy is rejected.** It mounts the production Connector — check its workspaces.
+  A copy that does not need production must not hold the production credential; give it a
+  Secret or a different Connector.
+- **A promotion is refused by `sources-carry-release-tags`.** A source tag matches none of the
+  approved patterns, or the reference carries no tag at all (an implicit `latest`). Promote a
+  release-tagged build or the image's digest; to admit another convention, add its pattern to
+  the list. A digest-pinned image's `.sig`/`.att` companions are admitted by the default list.
+  With the folded `promotion-content` rule from [Bundling](#bundling), this and the other four
+  content refusals all appear under that heading; the values echoed in its message tell them
+  apart.
+- **A run naming a legitimate approver is rejected.** The identity is missing from
+  `allowedApprovers` in `promotion-approvers`, or is spelled differently there than
+  the `ApprovalTask` expects (`group:` prefix included). The denial message prints both lists.
+- **With the optional `AccessPolicy` layer, the `ApprovalTask` is `approved` but the promotion
+  Pod never gets the credential.** The Connector releases the credential through an `AccessRequest`;
+  check it and the three things it depends on: `kubectl get accessrequest -n <connector-namespace>`
+  (the request lives in the Connector's namespace; its status names the check that is not
+  passing), the `AccessPolicy`'s `approvers` and
+  `numberOfApprovalsRequired` against `status.approversResponse` on the `ApprovalTask` (the
+  Connector may demand more, or different, approvers than the template collected), and the
+  feature flags listed under [Who May Approve](#approval).
+- **The copy fails with `x509: certificate signed by unknown authority` although
+  `srcTLSVerify` or `dstTLSVerify` is `"false"`.** The template does not declare that parameter,
+  so Tekton drops it from the run and the Task falls back to its default of `"true"`. Use the
+  template from the promotion page, which declares both.
+- **A Pod of a real promotion run is refused by `no-pod-outside-a-template`, or its `TaskRun`
+  by `no-taskrun-outside-a-template`.** The message prints the creator, the owner chain (the
+  `TaskRun` for a Pod, then the `PipelineRun`) and the `pipelineRef` the parent run was found to
+  carry. An empty `parentRef` means the owner references led to no run in that namespace — the
+  object was not created by the controller for a run, a Pod's `TaskRun` is not owned by a run,
+  or an object does exist under the referenced name but carries a different `uid`, which the
+  rules read as no parent at all; a filled one that was refused names a template outside
+  the rule's `templateNames`, a resolver (with catalog-served templates, adopt both variants:
+  [rule 1's](#rule-1-catalog) for the run and
+  [the parent test for rules 2 and 3](#catalog-parent-test)), a hub reference carrying a `url`
+  or a non-`artifact` `type` parameter, or an inline `pipelineSpec`. Keep `templateNames`
+  identical across rules 1, 2 and 3.
+- **A hand-written `TaskRun` is refused by `taskrun-owner-references-set-by-the-controller`.**
+  It carries an `ownerReferences` entry with `controller: true` naming a `PipelineRun`, which
+  only the Tekton controller may write — rule 3 trusts it. The rule compares the whole
+  reference, so editing one field of a reference that is already there is refused the same way.
+  Drop the reference: a `TaskRun` created directly is not part of any run.
+- **A `Deployment`, `Job` or other workload is refused by `autogen-no-pod-outside-a-template`.**
+  It mounts the production Connector, which rule 3 reserves for Pods the Tekton controller
+  creates for a promotion template — by design; such a workload must not hold the production
+  credential.
+- **A violating run is admitted.** First check the rule's policy is actually deployed — with a
+  subset, the missing rules' cases admit by design. Then check the precondition fired: the run
+  must name the Connector on a `connectors-csi` workspace, in one of the two forms shown in
+  [What Counts as a Promotion](#what-counts). A precondition that never matches produces no
+  denial *and no report entry* — silence here means "not evaluated", not "compliant".
+- **A non-maintainer can update the template, but not create or delete it.** The rule is missing
+  `allowExistingViolations: false`, and Kyverno is treating the update as a pre-existing
+  violation. The admission controller log shows
+  `skipping the rule evaluation as pre-existing violations are allowed` for the request.
+- **A policy shows READY=False.** Its rule failed to compile.
+  `kubectl describe clusterpolicy` on the failing policy reports the offending expression.
+- **A denial message renders as an empty string.** The message references a context variable that
+  did not resolve. Check the Kyverno admission controller log for the underlying error; a failed
+  context loader is reported there, not in the denial.
+- **No `PolicyReport` at all.** Reports are produced by the reports controller; confirm it is
+  running, and remember that `background: false` policies only report on admission requests.
+- **The promotion pipeline itself cannot be updated.** Either the requester is not listed as a
+  `<template-maintainer>` — add the identity `kubectl auth whoami` reports, or perform the
+  change with a listed one — or the edit names an approver outside `allowedApprovers`, which
+  rule 5 refuses regardless of who asks.
+
+## Learn More
+
+- [Promote Artifacts with Skopeo Copy](./promote_artifacts_with_skopeo_copy.mdx) — the promotion
+  pipeline these policies protect, including the approval step.
+- [Specifying remote tasks using hub resolvers](./specifying_remote_tasks_using_hub_resolvers.mdx)
+  — the Task reference form the templates use, and the resolver the catalog variant of rule 1
+  pins.
+- [Pipeline Policy Constraints with Tekton and Kyverno](https://cloud.alauda.io/kb#/solutions/Pipeline_Policy_Constraints_with_Tekton_and_Kyverno.html)
+  — the background article on how Kyverno constrains pipelines: where admission fits among the
+  available enforcement points, and how to choose between `Audit` and `Enforce` when rolling a
+  policy out.
+- <ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_csi.html" children="Alauda DevOps Connectors: Connectors CSI Driver" />
+  — how a run mounts a Connector, and the volume attributes the policies read.
+- <ExternalSiteLink name="connectors" href="/connectors/concepts/access_policy.html" children="Alauda DevOps Connectors: AccessPolicy" />
+  — the optional resource that can gate the production credential behind approval.
+- [Kyverno policy types](https://kyverno.io/docs/policy-types/) — the reference for the
+  `validate` constructs used here (`deny.conditions`, `foreach`, `preconditions`), and for the
+  `Policy` / `ClusterPolicy` distinction.

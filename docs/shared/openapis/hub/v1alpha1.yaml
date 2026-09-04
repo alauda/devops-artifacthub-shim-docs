@@ -101,8 +101,9 @@ paths:
         Returns the requested Tasks in request order. The request is atomic: if
         any resource is missing or not visible from the Namespace, the entire
         request returns `404`. The default deployment accepts at most 200
-        entries and limits the JSON body to 1 MiB. This operation requires
-        `list` permission on `hub.tekton.dev/resources`.
+        entries and limits the JSON body to 1 MiB. Unknown request properties
+        are ignored for compatibility with the legacy tektoncd-hubs-api. This
+        operation requires `list` permission on `hub.tekton.dev/resources`.
       security:
         - bearerAuth: []
       parameters:
@@ -169,8 +170,9 @@ paths:
         Returns the requested Pipelines in request order. The request is atomic:
         if any resource is missing or not visible from the Namespace, the entire
         request returns `404`. The default deployment accepts at most 200
-        entries and limits the JSON body to 1 MiB. This operation requires
-        `list` permission on `hub.tekton.dev/resources`.
+        entries and limits the JSON body to 1 MiB. Unknown request properties
+        are ignored for compatibility with the legacy tektoncd-hubs-api. This
+        operation requires `list` permission on `hub.tekton.dev/resources`.
       security:
         - bearerAuth: []
       parameters:
@@ -237,8 +239,10 @@ paths:
         Returns the requested StepActions in request order. The request is
         atomic: if any resource is missing or not visible from the Namespace,
         the entire request returns `404`. The default deployment accepts at
-        most 200 entries and limits the JSON body to 1 MiB. This operation
-        requires `list` permission on `hub.tekton.dev/resources`.
+        most 200 entries and limits the JSON body to 1 MiB. Unknown request
+        properties are ignored for compatibility with the legacy
+        tektoncd-hubs-api. This operation requires `list` permission on
+        `hub.tekton.dev/resources`.
       security:
         - bearerAuth: []
       parameters:
@@ -615,7 +619,10 @@ components:
       example: task
     HubResourceLookup:
       type: object
-      additionalProperties: false
+      additionalProperties: true
+      description: >-
+        Resource metadata for a UI batch lookup. Unknown properties are
+        ignored for compatibility with the legacy tektoncd-hubs-api.
       required:
         - catalog
         - name
