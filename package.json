@@ -18,5 +18,9 @@
   },
   "simple-git-hooks": {
     "pre-commit": "yarn lint"
+  },
+  "resolutions": {
+    "eslint-plugin-mdx": "3.7.0",
+    "eslint-mdx": "3.7.0"
   }
 }

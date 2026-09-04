@@ -4509,13 +4509,13 @@ __metadata:
   languageName: node
   linkType: hard
 
-"eslint-mdx@npm:^3.8.1":
-  version: 3.8.1
-  resolution: "eslint-mdx@npm:3.8.1"
+"eslint-mdx@npm:3.7.0":
+  version: 3.7.0
+  resolution: "eslint-mdx@npm:3.7.0"
   dependencies:
     acorn: "npm:^8.15.0"
     acorn-jsx: "npm:^5.3.2"
-    espree: "npm:^9.6.1 || ^10.4.0 || ^11.2.0"
+    espree: "npm:^9.6.1 || ^10.4.0"
     estree-util-visit: "npm:^2.0.0"
     remark-mdx: "npm:^3.1.0"
     remark-parse: "npm:^11.0.0"
@@ -4531,15 +4531,15 @@ __metadata:
   peerDependenciesMeta:
     remark-lint-file-extension:
       optional: true
-  checksum: 10c0/0ce68b91fb2159a740ca337ad0e5b79cde60cece08500496d67b6137c2b5f631d9867fe1f66384940ed9e21711925e6e4a6eeec85a3e459419bf93a61bb595c8
+  checksum: 10c0/e8c4a4616f58ee73d59eb6bf30cbc334530548795855d770abe5377751a44c0cd86cbf534197c36c9f0b5e10cd62f9641e1ad9b9f38cbf8b43ac75fc3057e0bb
   languageName: node
   linkType: hard
 
-"eslint-plugin-mdx@npm:^3.7.0":
-  version: 3.8.1
-  resolution: "eslint-plugin-mdx@npm:3.8.1"
+"eslint-plugin-mdx@npm:3.7.0":
+  version: 3.7.0
+  resolution: "eslint-plugin-mdx@npm:3.7.0"
   dependencies:
-    eslint-mdx: "npm:^3.8.1"
+    eslint-mdx: "npm:^3.7.0"
     mdast-util-from-markdown: "npm:^2.0.2"
     mdast-util-mdx: "npm:^3.0.0"
     micromark-extension-mdxjs: "npm:^3.0.0"
@@ -4551,7 +4551,7 @@ __metadata:
     vfile: "npm:^6.0.3"
   peerDependencies:
     eslint: ">=8.0.0"
-  checksum: 10c0/d24af2896e584c65d1404e5a39cfc3793a0fc2ed920f8df7c891d3da9b1abe69ccc527d2d290be4dfcca3666951b9ba8a168b4412f1416581859856af475e1a4
+  checksum: 10c0/a79a7900725e022fce2366c52359689e43b0ce4a94a172717068d50f3f51e2e4b53020c8de6582759370fb32934fd163f3768afe4c1f9e630621f27ca0b4bd6c
   languageName: node
   linkType: hard
 
@@ -4692,6 +4692,13 @@ __metadata:
   languageName: node
   linkType: hard
 
+"eslint-visitor-keys@npm:^4.2.1":
+  version: 4.2.1
+  resolution: "eslint-visitor-keys@npm:4.2.1"
+  checksum: 10c0/fcd43999199d6740db26c58dbe0c2594623e31ca307e616ac05153c9272f12f1364f5a0b1917a8e962268fdecc6f3622c1c2908b4fcc2e047a106fe6de69dc43
+  languageName: node
+  linkType: hard
+
 "eslint-visitor-keys@npm:^5.0.0, eslint-visitor-keys@npm:^5.0.1":
   version: 5.0.1
   resolution: "eslint-visitor-keys@npm:5.0.1"
@@ -4744,7 +4751,7 @@ __metadata:
   languageName: node
   linkType: hard
 
-"espree@npm:^11.2.0, espree@npm:^9.6.1 || ^10.4.0 || ^11.2.0":
+"espree@npm:^11.2.0":
   version: 11.2.0
   resolution: "espree@npm:11.2.0"
   dependencies:
@@ -4752,6 +4759,17 @@ __metadata:
     acorn-jsx: "npm:^5.3.2"
     eslint-visitor-keys: "npm:^5.0.1"
   checksum: 10c0/cf87e18ffd9dc113eb8d16588e7757701bc10c9934a71cce8b89c2611d51672681a918307bd6b19ac3ccd0e7ba1cbccc2f815b36b52fa7e73097b251014c3d81
+  languageName: node
+  linkType: hard
+
+"espree@npm:^9.6.1 || ^10.4.0":
+  version: 10.4.0
+  resolution: "espree@npm:10.4.0"
+  dependencies:
+    acorn: "npm:^8.15.0"
+    acorn-jsx: "npm:^5.3.2"
+    eslint-visitor-keys: "npm:^4.2.1"
+  checksum: 10c0/c63fe06131c26c8157b4083313cb02a9a54720a08e21543300e55288c40e06c3fc284bdecf108d3a1372c5934a0a88644c98714f38b6ae8ed272b40d9ea08d6b
   languageName: node
   linkType: hard
 

@@ -4,6 +4,7 @@ export default {
   ...defaultConfig,
   words: [
     ...(defaultConfig.words || []),
+    'alauda',
     'artifacthub',
     'Artifacthub',
     'ConfigMap',

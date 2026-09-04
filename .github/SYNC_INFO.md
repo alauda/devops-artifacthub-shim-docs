@@ -1,10 +1,10 @@
 # Documentation Sync Information
 
-- **Last synced**: 2026-09-04 03:21:16 UTC
+- **Last synced**: 2026-09-04 03:31:01 UTC
 - **Source repository**: alaudadevops/artifacthub-shim
-- **Source commit**: [3f833162c9f265846adf0004f73ec3ca8dc4337f](https://github.com/alaudadevops/artifacthub-shim/commit/3f833162c9f265846adf0004f73ec3ca8dc4337f)
+- **Source commit**: [5cd9b5df44bdf7f524ef2d4771d5bbadcaaede1d](https://github.com/alaudadevops/artifacthub-shim/commit/5cd9b5df44bdf7f524ef2d4771d5bbadcaaede1d)
 - **Triggered by**: yuzichen12123
-- **Workflow run**: [#12](https://github.com/alaudadevops/artifacthub-shim/actions/runs/33832886778)
+- **Workflow run**: [#14](https://github.com/alaudadevops/artifacthub-shim/actions/runs/33833473233)
 
 ## Files synced:
 - docs/
