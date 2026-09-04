@@ -1,6 +1,9 @@
 - name: acp
   base: /container_platform
-  version: "4.3"
+  version: "4.4"
 - name: alauda-devops-pipelines
   base: /alauda-devops-pipelines
-  version: "4.13"
+  version: "4.14"
+- name: connectors
+  base: /alauda-devops-connectors
+  version: "1.12"
