@@ -137,6 +137,7 @@ Common Event reasons:
 | `RepositoryConfigAccepted` | `repository.yaml` was accepted. |
 | `RepositoryConfigInvalid` | `repository.yaml` is missing, cannot be parsed, or failed validation. |
 | `RepositorySourceReady` | A repository source was indexed and is visible. |
+| `RepositorySourceWarning` | A repository source is Ready, but one or more invalid Kubernetes resources were skipped. |
 | `RepositorySourceInvalid` | A repository source did not enter the current snapshot. |
 | `RepositorySourceDegraded` | A repository source failed this refresh but still serves its previous successful shard. |
 | `RepositoryScopeInvalid` | The visibility label or scoped-source policy is invalid. |
@@ -159,7 +160,7 @@ Common reason message patterns:
 | `path must be relative` | `path` is absolute. |
 | `path must not escape repository root` | `path` uses `..` to leave the repository root. |
 | `duplicate repository name` | Several sources share the same case-insensitive repository name. One deterministic winner remains indexed and the other sources are rejected. |
-| `duplicate repository name superseded by higher-priority source ...` | Another source with the same repository name has higher priority (built-in catalog, or a ConfigMap in the install namespace), so this lower-priority source is rejected while the winner stays indexed. |
+| `duplicate repository name superseded by higher-priority source ...` | Another source with the same repository name has higher priority (built-in catalog, then a ConfigMap in the shim namespace, then a ConfigMap in another namespace, all of which outrank automatic Kubernetes discovery), so this lower-priority source is rejected while the winner stays indexed. |
 | `legacy catalog alias ... conflicts with a canonical repository name ... and was disabled` | A `legacyCatalogAliases[]` value matches an existing repository `name` for the same kind. The alias is disabled while the canonical source remains available. |
 | `legacy catalog alias ... resolves to multiple repositories ... and was disabled` | Two sources declare the same legacy alias for the same kind. The alias is disabled while both canonical sources remain available. |
 | `secret ... not found` | `credentialRef.name` points to a missing Secret. |
@@ -176,6 +177,7 @@ conflict is resolved by source priority (highest to lowest):
 2. ConfigMap sources registered in the install namespace
    (`artifacthub-shim-system` by default).
 3. ConfigMap sources registered in any other Namespace.
+4. Automatic Kubernetes label discovery in the install namespace.
 
 The highest-priority source wins and stays indexed; lower-priority duplicates
 are marked `Invalid`. When multiple sources share the same priority, the winner
@@ -231,7 +233,30 @@ Supported keys are:
 
 Do not place credentials in the ConfigMap.
 
-### 7. Check API pod logs
+### 7. Check Kubernetes-backed catalog resources
+
+For automatic sources, verify both labels on each resource:
+
+```bash
+kubectl get task,pipeline,stepaction -n artifacthub-shim-system --show-labels
+```
+
+`artifacthub-shim.alauda.io/catalog` selects the catalog and
+`app.kubernetes.io/version` is required. For a ConfigMap-defined source,
+confirm the target Namespace is listed in `config.kubernetesSources.allowedNamespaces`
+and that the selector matches the resource labels. An omitted selector defaults
+to `artifacthub-shim.alauda.io/catalog=<repository.name>`; `selector: {}`
+matches every resource of the selected kind.
+
+The ServiceAccount needs `get`, `list`, and `watch` on `tasks`, `pipelines`,
+and `stepactions` in every target Namespace. Watch events normally trigger an
+immediate refresh, while the periodic refresh repairs missed events. Missing
+version labels and malformed individual resources are reported as warnings and
+do not hide valid resources in the same source. If every matched resource is
+invalid, the Kubernetes source fails with a permanent error instead of serving
+an empty catalog.
+
+### 8. Check API pod logs
 
 ```bash
 kubectl logs -n artifacthub-shim-system \
@@ -242,7 +267,7 @@ kubectl logs -n artifacthub-shim-system \
 Look for Git clone errors, YAML parse errors, manifest identity errors, or
 content size limit errors.
 
-### 8. Check disabled package rules
+### 9. Check disabled package rules
 
 If the source is `Ready` but a specific package is missing, check
 `disabledPackages` in the repository ConfigMap and `config.disabledPackages` in

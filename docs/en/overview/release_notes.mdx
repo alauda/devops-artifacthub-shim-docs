@@ -5,6 +5,8 @@ queries:
   - What is included in Artifact Hub Shim v1.0.0?
   - What changed in the first GA release of Artifact Hub Shim?
   - Are there known issues in Artifact Hub Shim v1.0.0?
+  - Which ACP versions support Artifact Hub Shim v1.0.0?
+  - Which Alauda DevOps Pipelines versions work with Artifact Hub Shim v1.0.0?
 ---
 
 # Release Notes
@@ -12,7 +14,44 @@ queries:
 ## Integration Requirements
 
 Artifact Hub Shim is installed as an ACP cluster plugin. Tekton resolver and
-Pipelines as Code integration require `Alauda DevOps Pipelines` v4.0 or later.
+Pipelines as Code integration require a supported `Alauda DevOps Pipelines`
+(`tektoncd-operator`) release.
+
+### Supported Alauda DevOps Pipelines versions
+
+Artifact Hub Shim `v1.0.0` is supported out of the box with the already
+released `Alauda DevOps Pipelines` `v4.14.0`. Support on the `4.10`, `4.6`,
+and `4.0` product lines becomes available after the following minimum
+`tektoncd-operator` patch versions are released:
+
+| Alauda DevOps Pipelines line | Minimum patch version |
+| :--- | :--- |
+| `4.14` | `v4.14.0` (released) |
+| `4.10` | `v4.10.2` |
+| `4.6` | `v4.6.4` |
+| `4.0` | `v4.0.17` |
+
+If you need Artifact Hub Shim `v1.0.0` on an earlier `tektoncd-operator` patch
+version, contact the Alauda DevOps team.
+
+### Supported ACP versions
+
+`Alauda DevOps Pipelines` `v4.14.x` and Artifact Hub Shim `v1.0.0` depend on a
+platform capability that earlier ACP patch versions do not provide. On ACP
+`4.0` through `4.3` they therefore require a minimum ACP patch version, and
+support becomes available once that ACP patch version is released:
+
+| ACP version | Minimum ACP patch version |
+| :--- | :--- |
+| `4.0` | `4.0.13` |
+| `4.1` | `4.1.7` |
+| `4.2` | `4.2.6` |
+| `4.3` | `4.3.3` |
+
+On ACP `4.4` and later there is no such restriction.
+
+If you need Artifact Hub Shim `v1.0.0` with `Alauda DevOps Pipelines` `v4.14.x`
+on an earlier ACP patch version, contact the Alauda DevOps team.
 
 ## v1.0.0
 

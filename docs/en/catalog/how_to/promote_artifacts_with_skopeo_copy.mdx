@@ -31,8 +31,13 @@ succeeds.
 - The `skopeo-copy` `Task` is available from the configured Hub catalog.
 - `Manual Approval Gate` is deployed for the approval workflow shown in this
   guide.
+- Alauda DevOps Connectors is installed, for
+  [Keep the Production Credential in a Connector](#production-connector) — the
+  recommended shape for a production destination.
 - Source and destination registry credentials are prepared as Kubernetes
-  `Secret` objects in the namespace where the `PipelineRun` runs.
+  `Secret` objects in the namespace where the `PipelineRun` runs. For a
+  production destination, the credential lives in a `Connector` instead of a
+  `Secret` — see [Keep the Production Credential in a Connector](#production-connector).
 - The pipeline author can create or update `Pipeline` resources, and the run
   user can create `PipelineRun` resources in the target namespace.
 - You understand basic `Pipeline`, `PipelineRun`, `Task`, and `Workspace`
@@ -45,14 +50,28 @@ A typical image promotion pipeline contains two stages:
 1. `wait-for-approval`: requires designated approvers to approve the promotion.
 2. `promote-images`: copies one or more images with `skopeo-copy`.
 
-Keep the approval policy in the `Pipeline` definition. Do not expose approval
-policy parameters such as `approvers`, `numberOfApprovalsRequired`, or approval
-rules as `PipelineRun` parameters. If those values are exposed at run time, a
-pipeline executor could override the default approval rule and bypass the
-intended release control.
+Keeping the approval policy in the `Pipeline` definition is the simplest safe
+shape: if `approvers`, `numberOfApprovalsRequired`, or approval rules are
+exposed as `PipelineRun` parameters with nothing validating them, whoever
+starts the run can override the approval rule and bypass the intended release
+control. When different promotions need different approvers, expose `approvers`
+as a run parameter **together with** the approver guardrail from
+[Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx),
+which validates run-supplied approvers against an allowed list before the run
+is created.
 
-The `PipelineRun` should only provide values that legitimately change per run,
-such as the source and destination image mappings.
+Beyond that, the `PipelineRun` should only provide values that legitimately
+change per run, such as the source and destination image mappings.
+
+Note what the approval step by itself enforces: it pauses the pipeline, nothing more. The
+destination credential is an ordinary Secret that anything in the namespace can mount,
+approval or not. [Keep the Production Credential in a Connector](#production-connector) takes
+the raw credential out of the namespace — the run borrows it through a `Connector` and never
+sees the password — and the admission guardrails from
+[Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx)
+then reserve that Connector for Pods the Tekton controller creates from this template, so the
+approval step becomes the only way to production. An optional gate at the end of that section
+can additionally make the Connector withhold the credential until the approval is recorded.
 
 ## Steps
 
@@ -60,6 +79,8 @@ such as the source and destination image mappings.
 
 Create one secret for the source registry and another for the destination
 registry. The following examples use `kubernetes.io/dockerconfigjson` secrets:
+
+Replace in this block: `<namespace>`, `<source-username>`, `<source-password>`, `<destination-username>`, `<destination-password>`.
 
 ```bash
 kubectl create secret docker-registry src-registry-config \
@@ -75,15 +96,29 @@ kubectl create secret docker-registry dst-registry-config \
   --docker-password=<destination-password>
 ```
 
-If the same credential can access both registries, you can bind the same secret
-to both workspaces.
+If the same credential can access both registries, you can bind the same secret to both
+workspaces — for a non-production destination only. A production credential must not exist as
+a Secret at all once [Keep the Production Credential in a Connector](#production-connector)
+is done, so keep the source credential in its own Secret; that section ends by deleting the
+destination one.
+
+**For a production destination, treat `dst-registry-config` as scaffolding, not the end
+state.** It is an ordinary Secret: every Pod in the namespace can mount it, approval or not.
+[Keep the Production Credential in a Connector](#production-connector) replaces it with a
+`Connector` and ends by deleting this Secret; finish that section before the pipeline is
+trusted with production.
 
 ### 2. Create the Promotion Pipeline
 
 The following pipeline fixes the approval policy in the `Pipeline` and exposes
 only `imageMappings`, `srcTLSVerify`, and `dstTLSVerify` as run-time inputs.
-Replace `release-manager` and `group:release-approvers` with the canonical user
-and group identifiers from your identity provider.
+Replace the approver identities with the canonical user and group identifiers
+from your identity provider. The example names one release manager and one
+dedicated approver group. If you later adopt the optional credential-release
+gate in [Optional: release the credential only after approval](#connector-approval),
+keep this list **identical** to the identities the gate's `AccessPolicy` names —
+that section explains why a wider list here would fail runs instead of
+broadening who can help.
 
 ```yaml
 apiVersion: tekton.dev/v1
@@ -106,6 +141,16 @@ spec:
   workspaces:
     - name: src-registry-config
     - name: dst-registry-config
+    - name: src-ca-bundle
+      optional: true
+      description: >-
+        CA files for the source registry. Bind it only when that registry presents a
+        certificate the copy does not already trust.
+    - name: dst-ca-bundle
+      optional: true
+      description: >-
+        CA files for the destination registry. Bind it only when that registry presents a
+        certificate the copy does not already trust.
   tasks:
     - name: wait-for-approval
       taskRef:
@@ -116,7 +161,7 @@ spec:
         - name: approvers
           value:
             - release-manager
-            - group:release-approvers
+            - group:prod-promotion-approvers
         - name: numberOfApprovalsRequired
           value: "1"
         - name: description
@@ -128,8 +173,6 @@ spec:
       taskRef:
         resolver: hub
         params:
-          - name: type
-            value: artifact
           - name: catalog
             value: catalog
           - name: kind
@@ -151,12 +194,52 @@ spec:
           workspace: src-registry-config
         - name: dst-registry-config
           workspace: dst-registry-config
+        # Both CA workspaces are passed straight through, one to one, so each run decides what
+        # its two hops need. Which side needs a CA is a property of the run — a Connector-backed
+        # destination, a private CA on the source — not of the template, and a workspace the run
+        # leaves unbound simply keeps system trust.
+        - name: src-ca-bundle
+          workspace: src-ca-bundle
+        - name: dst-ca-bundle
+          workspace: dst-ca-bundle
 ```
 
 The `imageMappings` parameter accepts one `SRC DST` mapping per array item. Each
 image reference must include the `skopeo` transport prefix, such as `docker://`.
-When `imageMappings` is not empty, `skopeo-copy` uses it for batch promotion and
-ignores `srcImage` and `dstImages`.
+Everything that follows on this page — the Connector-backed destination and the
+guardrails in [Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx) — is built on
+this parameter.
+
+The last two workspaces are what let a Connector-backed run keep TLS verification on.
+`skopeo-copy` declares `src-ca-bundle` and `dst-ca-bundle` as optional workspaces; when one is
+bound it passes that path to `skopeo` as a certificate directory, and every `*.crt` file in it
+is trusted. The template exposes both as optional pipeline workspaces and binds neither itself,
+because which hop needs a CA is a property of the run, not of the template.
+
+With a Connector-backed destination, only one hop is re-signed. The mount's `.env` does send the
+whole copy — the source pull as well as the destination push — through the Connectors forward
+proxy, but the proxy substitutes its own certificate only for a `CONNECT` target that matches
+the Connector's own address, host and port included. Every other host is tunnelled through
+untouched, and the client sees the upstream server's original certificate. So the destination
+connection presents the Connectors CA, and the source connection presents the source registry's
+own.
+
+That is why the Connector-backed run below binds `dst-ca-bundle` to the same `connectors-csi`
+volume as `dst-registry-config`: the mount ships a `ca.crt` file, and it *is* the CA the proxy
+re-signs with — read live from the mount instead of copied into a `ConfigMap` that would go
+stale, since the CA is issued by cert-manager with a 90-day lifetime and rotates. That second
+binding needs one addition, `configuration.names: registry-config,!ca.cert`. The mount also
+carries `ca.cert`, a deprecated alias of the same certificate, and `skopeo` reads any `*.cert`
+file in a certificate directory as a *client* certificate — it aborts looking for a matching
+`ca.key` that the mount has no reason to hold. The driver's `!<file>` exclusion drops the alias
+and leaves `ca.crt`.
+
+`src-ca-bundle` is the site's own to fill: bind it to a `ConfigMap` or `Secret` holding the
+source registry's CA as a `*.crt` file when that registry uses a private CA, and leave it
+unbound otherwise — an unbound workspace adds nothing to the trust store, and the copy falls
+back to system trust, which is what a publicly trusted registry needs. The Secret-backed run in
+the next section binds neither workspace for that reason; if either registry in such a run uses
+a private CA, bind that side to a `ConfigMap` holding it.
 
 ### 3. Start a Promotion Run
 
@@ -199,17 +282,42 @@ while the whole `PipelineRun` can run for up to `72h`.
 
 ## Alternative: Promote One Image to Multiple Destinations
 
-If you are promoting one source image to one or more target tags, you can also
-use `srcImage` and `dstImages` instead of `imageMappings`:
+One source image promoted to several destination tags needs no other form: `imageMappings`
+takes it as a list of `SRC DST` pairs with the source repeated once per destination.
+
+```yaml
+params:
+  - name: imageMappings
+    value:
+      - docker://dev-registry.example.com/team/app-api:1.2.3 docker://prod-registry.example.com/team/app-api:1.2.3
+      - docker://dev-registry.example.com/team/app-api:1.2.3 docker://prod-registry.example.com/team/app-api:stable
+```
+
+Keep that form wherever the rest of this page applies. The Connector-backed destination
+below and the guardrails in
+[Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx) are built on `imageMappings`: the
+guardrails' content rules judge only that parameter, so a run using the alternative below
+has its sources, destinations and paths unexamined, and where the rule requiring non-empty
+mappings is deployed it is refused outright.
+
+The alternative is the task's simple mode — a `srcImage` and a `dstImages` list, which the
+pipeline above does not use, and which the task ignores whenever `imageMappings` is not
+empty. It suits a pipeline outside the guardrails' scope that copies one source to a few
+tags. To adopt it, replace the entire `promote-images` task in the pipeline above with the
+task below — it sits in the same place under `spec.tasks`, keeps the task name (so the
+commands later on this page still find its `TaskRun`), and keeps `runAfter` so the copy
+still waits for the approval. Remove the pipeline's `imageMappings` parameter along with
+it: nothing consumes it any more, and because it is declared without a default, a run that
+stops supplying it fails with `ParameterMissing`.
 
 ```yaml
 tasks:
-  - name: promote-image
+  - name: promote-images
+    runAfter:
+      - wait-for-approval
     taskRef:
       resolver: hub
       params:
-        - name: type
-          value: artifact
         - name: catalog
           value: catalog
         - name: kind
@@ -225,14 +333,421 @@ tasks:
         value: dev-registry.example.com/team/app-api:1.2.3
       - name: dstTransport
         value: registry
+      - name: srcTLSVerify
+        value: $(params.srcTLSVerify)
+      - name: dstTLSVerify
+        value: $(params.dstTLSVerify)
       - name: dstImages
         value:
           - prod-registry.example.com/team/app-api:1.2.3
           - prod-registry.example.com/team/app-api:stable
+    workspaces:
+      - name: src-registry-config
+        workspace: src-registry-config
+      - name: dst-registry-config
+        workspace: dst-registry-config
+      # Same CA plumbing as the reviewed template above: both CA workspaces are passed
+      # through one to one, and the run binds whichever side needs a CA the copy does not
+      # already trust. Both TLS switches can stay "true" either way.
+      - name: src-ca-bundle
+        workspace: src-ca-bundle
+      - name: dst-ca-bundle
+        workspace: dst-ca-bundle
 ```
 
-Use this form only when one source image needs one or more destination tags. Use
-`imageMappings` when a promotion run contains multiple source images.
+Use this form only for a pipeline outside the guardrails' scope. Under them — and whenever a
+promotion run contains more than one source image — use `imageMappings`.
+
+## Keep the Production Credential in a Connector \{#production-connector}
+
+With plain `dockerconfigjson` Secrets, the approval step is only orchestration: anyone who can
+read Secrets or create a Pod in the namespace can take `dst-registry-config` and push to
+production, approval or not. Alauda DevOps Connectors takes the raw credential out of the
+pipeline's namespace: the production credential lives only in a `Connector` kept in a
+namespace the pipeline's users cannot read, the run's Pods borrow it across namespaces through
+the `connectors-csi` driver, and the Pod never sees the password — the mount carries proxy
+settings and the run's short-lived token, and the Connectors proxy injects the real credential
+on the way to the registry. The gain is exactly that split: the pipeline's users can *mount*
+the credential, under whatever conditions the guardrails and the optional gate impose, but can
+never *read* it. The concept page
+<ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_csi.html" children="Connectors CSI Driver" />
+describes the machinery; this section moves the promotion pipeline above onto it.
+
+Be precise about what this does and does not do. It removes every copy of the password from
+the pipeline namespace, so nothing can push to production without mounting the Connector. It
+does **not**, by itself, decide *which* Pods may mount it — any Pod running as a service
+account that may `get` the Connector can, and in the pipeline namespace that is every Pod
+using the run's service account. That is what the admission guardrails in
+[Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx)
+add: they reserve the Connector for Pods the Tekton controller creates for a run of this
+template, so the approval step becomes the only way through. Adopt the two together for a
+production destination. The [optional gate](#connector-approval) at the end of this section
+can additionally make the driver withhold the credential until the run's approval is
+recorded; it is not required for the shape above.
+
+### 1. Move the destination credential into a Connector
+
+Create an OCI-class `Connector` for the production registry in a namespace whose Secrets the
+pipeline's users cannot read — one owned by the credential's owners, `<connector-namespace>`
+below. A Connector's secret must live in the Connector's own namespace, which is why the
+Connector moves out with it, not the Secret alone:
+
+Replace in this block: `<connector-namespace>`, `<destination-username>`, `<destination-password>`.
+
+```yaml
+apiVersion: v1
+kind: Secret
+metadata:
+  name: prod-registry-auth
+  namespace: <connector-namespace>
+type: cpaas.io/distribution-registry-token
+stringData:
+  username: <destination-username>
+  password: <destination-password>
+---
+apiVersion: connectors.alauda.io/v1alpha1
+kind: Connector
+metadata:
+  name: prod-registry
+  namespace: <connector-namespace>
+spec:
+  connectorClassName: oci
+  address: https://prod-registry.example.com
+  auth:
+    name: tokenAuth
+    secretRef:
+      name: prod-registry-auth
+      namespace: <connector-namespace>
+```
+
+Then let the promotion runs mount it. The `connectors-csi` driver publishes a volume only if
+the Pod's service account may `get` that Connector in the Connector's namespace; grant exactly
+that, to the pipeline's service account and nothing wider:
+
+Replace in this block: `<connector-namespace>`, `<namespace>`, `<pipeline-service-account>`.
+
+```yaml
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: prod-registry-mount
+  namespace: <connector-namespace>
+rules:
+  - apiGroups:
+      - connectors.alauda.io
+    resources:
+      - connectors
+    resourceNames:
+      - prod-registry
+    verbs:
+      - get
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: RoleBinding
+metadata:
+  name: prod-registry-mount
+  namespace: <connector-namespace>
+roleRef:
+  apiGroup: rbac.authorization.k8s.io
+  kind: Role
+  name: prod-registry-mount
+subjects:
+  # One entry per namespace promotion runs are created in; the service account is
+  # `default` unless the promotion runs set `taskRunTemplate.serviceAccountName`.
+  - kind: ServiceAccount
+    name: <pipeline-service-account>
+    namespace: <namespace>
+```
+
+### 2. Bind the run's destination workspace to the Connector
+
+Bind the run's destination workspace to the Connector instead of the secret:
+
+Replace in this block: `<connector-namespace>`.
+
+```yaml
+workspaces:
+  - name: src-registry-config
+    secret:
+      secretName: src-registry-config
+  - name: dst-registry-config
+    csi:
+      driver: connectors-csi
+      readOnly: true
+      volumeAttributes:
+        connector.namespace: <connector-namespace>
+        connector.name: prod-registry
+        configuration.names: registry-config
+  # The mount's built-in ca.crt is the Connectors proxy CA that re-signs the destination
+  # connection, so the same mount is also the destination CA workspace.
+  # !ca.cert drops the mount's deprecated alias of that file: skopeo reads any *.cert in a
+  # certificate directory as a client certificate and aborts asking for a matching ca.key.
+  - name: dst-ca-bundle
+    csi:
+      driver: connectors-csi
+      readOnly: true
+      volumeAttributes:
+        connector.namespace: <connector-namespace>
+        connector.name: prod-registry
+        configuration.names: registry-config,!ca.cert
+```
+
+:::details Complete `PipelineRun` with the Connector-backed destination (copy-paste ready)
+
+Replace in this block: `<connector-namespace>`, and the page's running example values — the
+Connector name `prod-registry` and the `imageMappings` entry — with your own. The `src-ca-bundle`
+binding is there for a source registry with a private CA — remove it, and the source is verified
+against system trust like any publicly trusted registry.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: promote-artifacts-prod-connector-run
+spec:
+  pipelineRef:
+    name: promote-artifacts-with-approval
+  timeouts:
+    pipeline: 72h
+    tasks: 72h
+  params:
+    - name: imageMappings
+      value:
+        - docker://dev-registry.example.com/team/app-api:1.2.3 docker://prod-registry.example.com/team/app-api:1.2.3
+    # The mounted configuration routes both connections through Connectors Proxy, but the
+    # proxy re-signs only the destination one — every other host is tunnelled through and keeps
+    # its own certificate. Verification stays on for both: dst-ca-bundle below carries the
+    # mount's ca.crt, the CA the proxy signs with, and the source is verified against system
+    # trust or against the CA bound to src-ca-bundle.
+    - name: srcTLSVerify
+      value: "true"
+    - name: dstTLSVerify
+      value: "true"
+  workspaces:
+    - name: src-registry-config
+      secret:
+        secretName: src-registry-config
+    # Only when the source registry uses a private CA: a ConfigMap holding it as a *.crt file.
+    # Leave this binding out for a source with a publicly trusted certificate.
+    - name: src-ca-bundle
+      configMap:
+        name: src-registry-ca
+    - name: dst-registry-config
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.namespace: <connector-namespace>
+          connector.name: prod-registry
+          configuration.names: registry-config
+    # The same mount again: its built-in ca.crt is the Connectors proxy CA that re-signs the
+    # destination connection, and it stays current on its own as that CA rotates.
+    # !ca.cert drops the mount's deprecated alias of that file: skopeo reads any *.cert in a
+    # certificate directory as a client certificate and aborts asking for a matching ca.key.
+    - name: dst-ca-bundle
+      csi:
+        driver: connectors-csi
+        readOnly: true
+        volumeAttributes:
+          connector.namespace: <connector-namespace>
+          connector.name: prod-registry
+          configuration.names: registry-config,!ca.cert
+```
+
+:::
+
+**Fallback: turn a switch off instead.** The Connectors documentation for the OCI forward proxy
+in Tekton passes `--tls-verify=false`, because the proxy re-signs the connection it intercepts.
+The two switches are independent, so treat them one at a time. `dstTLSVerify: "false"` is the
+fallback for a template that cannot bind the Connector mount as the destination CA workspace —
+the case that documentation covers. `srcTLSVerify: "false"` is only for a source registry that
+intentionally uses insecure or self-signed access and whose CA you will not provide; a proxied
+destination never makes it necessary, because the source hop is tunnelled and presents the
+source registry's own certificate. Neither is the copy-paste path: the run above trusts the
+proxy CA on the destination and leaves the source at system trust.
+
+Once a run works this way, delete the old `dst-registry-config` Secret: as long as the raw
+credential exists as a Secret, anything that can read the Secret can bypass every gate.
+One side effect is already handled above: the mounted configuration routes the copy through
+Connectors Proxy, which re-signs the destination connection with the Connectors CA, and the run
+binds that same mount — minus its `ca.cert` alias — to the task's `dst-ca-bundle` workspace, so
+the push trusts the mount's `ca.crt` and `dstTLSVerify` stays `"true"`. The source connection is
+tunnelled through untouched and keeps the source registry's own certificate, so `srcTLSVerify`
+stays `"true"` as well, against system trust or against the CA bound to `src-ca-bundle`. If you
+also deploy the
+[promotion guardrails](./constrain_artifact_promotion_with_kyverno.mdx), those two workspaces are
+already in rule 10's `allowedCopyWorkspaces` list, so the template needs no further review.
+
+### Optional: release the credential only after approval \{#connector-approval}
+
+An `AccessPolicy` on the Connector can make the driver release the credential to one Pod at a
+time — only after that Pod's run has been approved, and only when the approving identities are
+the ones the policy itself names. The concept pages
+<ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_approval.html" children="Connectors Approval & Permission Gating" />,
+<ExternalSiteLink name="connectors" href="/connectors/concepts/access_policy.html" children="AccessPolicy" /> and
+<ExternalSiteLink name="connectors" href="/connectors/concepts/access_request.html" children="AccessRequest" />
+describe the machinery.
+
+Two framing notes before deciding. First, this gate adds **no second approval**: the
+approver still acts once, on the run's `ApprovalTask` — the `AccessRequest` the gate creates
+is resolved automatically from that same approval, and the gate only decides whether that
+single act releases the credential. Second, it is a **cluster-wide** change: it needs two
+feature flags that alter the behavior of every Connector on the cluster, and every namespace
+that already uses Connectors must be prepared before they are flipped — step 1 below. Reserve
+it for a production destination whose credential owners are not the pipeline's owners and
+want the final say at the credential; for everything else, the template's own approvers,
+protected by the guardrails, are the gate.
+
+#### 1. Enable the approval feature flags
+
+Approval-gated access needs two feature flags that are off by default:
+`enable-connectors-approval` and `enable-connector-proxy-permissions`. On an operator-managed
+installation both are set on the `ConnectorsConfig` resource — the operator reconciles
+`ConnectorsCore` from it, so a flag patched directly on `ConnectorsCore` is silently reverted:
+
+Replace in this block: `<name>`, `<connectors-operator-namespace>`.
+
+```bash
+kubectl get connectorsconfigs -A
+kubectl patch connectorsconfig <name> -n <connectors-operator-namespace> --type=merge \
+  -p '{"spec":{"components":{"core":{"spec":{"featureFlags":{"enable-connectors-approval":"true","enable-connector-proxy-permissions":"true"}}}}}}'
+
+# Confirm both flags propagated:
+kubectl get connectorscore -A \
+  -o jsonpath='{range .items[*]}{.metadata.name}{": "}{.spec.featureFlags.enable-connectors-approval}{" "}{.spec.featureFlags.enable-connector-proxy-permissions}{"\n"}{end}'
+```
+
+Flipping them is a cluster-wide change, not a change to this Connector: with both on, every
+`connectors-csi` mount on the cluster is authorized through the Connector's `connectors/proxy`
+permission, and a workload that mounts a Connector it has not been granted is not refused
+loudly — its mount carries only an `.error.json` marker, and it fails later for want of
+credentials. So before the flip, inventory the workloads that mount a Connector today and
+grant them that permission on every Connector **except the production one you are about to
+gate**; the current procedure is in
+<ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_approval.html" children="Connectors Approval & Permission Gating" />.
+Two constraints hold whatever that procedure looks like. Give the production Connector no
+standing `connectors/proxy` grant — the `get` grant from step 1 of the Connector section
+stays, it is what the mount needs; `connectors/proxy` is what the gate releases per run, and
+the driver's check is a plain permission question, so a standing grant of it is satisfied
+with no approval at all and the gate in step 2 would never engage. And let no promotion run
+straddle the flip: between the flag change and step 2, its copy Pod would mount only an
+`.error.json` marker and fail, so finish step 2 before the next promotion starts, or drain
+in-flight runs first with the commands under
+[Rolling out](./constrain_artifact_promotion_with_kyverno.mdx#rollout) in the Kyverno guide.
+
+#### 2. Require approval — by the identities you name
+
+An `AccessPolicy` in the Connector's namespace grants no default access; it releases the
+credential per Pod, after the built-in check finds the run's `ApprovalTask` approved by the
+identities the policy names:
+
+Replace in this block: `<connector-namespace>`.
+
+```yaml
+apiVersion: connectors.alauda.io/v1alpha1
+kind: AccessPolicy
+metadata:
+  name: prod-registry-approval
+  namespace: <connector-namespace>
+spec:
+  connector:
+    names:
+      - prod-registry
+  checkGrantedPermission:
+    spec:
+      checks:
+        - name: manual-approval
+          ref:
+            configMap:
+              name: connectors-approvals-in-pipeline
+          params:
+            - name: approvers
+              value:
+                - release-manager
+                - group:prod-promotion-approvers
+            - name: numberOfApprovalsRequired
+              value: "1"
+      roleTemplate:
+        ref:
+          configMap:
+            name: connectors-use-connectors-proxy-in-pod
+```
+
+The two referenced ConfigMaps are installed by Alauda DevOps Connectors in its own system
+namespace. Omitting the `approvers` parameter keeps the legacy behavior — any approval of the
+`ApprovalTask` releases the credential; with the parameter set, only the named identities'
+own approvals count.
+
+One contract must hold: **every identity the policy names must also be on the template's
+`approvers` list — and the recommended default is to keep the two lists identical**, as the
+pipeline above and the policy above are. The check reads the `ApprovalTask`'s recorded
+responses, and those mirror the template's approver entries — a username in the policy is
+satisfied only by that user approving as themselves, and a `group:` entry only by members of
+that same group approving through it, each approving member counting individually toward
+`numberOfApprovalsRequired`. A template list *wider* than the policy's is a trap, not a
+convenience: with one approval required, the first response completes the `ApprovalTask`, so
+an approval by someone on the template's list but outside the policy's fails the run with
+`ApproverMismatch` (see the next section) instead of waiting for the right person. With the
+lists identical, `ApproverMismatch` can only mean tampering.
+
+Which shape to pick follows from who owns what. When one team owns both the pipeline and the
+credential, omit the `approvers` parameter — identity control then lives in the template's
+own `approvers` list, and there is no second list to keep aligned. Name identities in the
+policy when the credential's owners are not the pipeline's owners: the policy is an object in
+the Connector's namespace, so the credential side keeps the final say no matter what the
+template names.
+
+Before trusting the gate, prove that the promotion runs' service accounts hold no standing
+proxy access to the production Connector — a standing proxy grant left from the preparation
+before the flip would let the driver release the credential without any approval. The check
+covers the service accounts you name; beyond it, keep the production Connector out of every
+standing `connectors/proxy` grant in its namespace — any `Role`/`RoleBinding` or
+`defaultPermission` policy that names it. The get-only grant from step 1 of the Connector
+section is not one of those: it stays, the mount needs it. Run this while no promotion run is in flight (an approved run holds a
+temporary Pod-bound grant until its Pod completes):
+
+Replace in this block: `<connector-namespace>`, `<namespace>`, `<pipeline-service-account>`.
+
+```bash
+# Expect: no -- repeat for every service account the promotion runs use: `default` unless a
+# run sets `taskRunTemplate.serviceAccountName`, in which case that one.
+kubectl auth can-i '*' connectors.connectors.alauda.io/prod-registry --subresource=proxy \
+  --as=system:serviceaccount:<namespace>:<pipeline-service-account> -n <connector-namespace>
+```
+
+`yes` here means a standing grant covers the Connector: find the `Role`/`RoleBinding` or
+`defaultPermission` policy that names it and remove the production Connector from it.
+
+#### 3. What happens at run time
+
+The flow below was verified live on a real cluster, Connector and `PipelineRun` included:
+
+- **Approval pending:** the copy Pod waits at volume mount, and the `AccessRequest` created
+  for it reports `AccessCheckReady: Unknown` with reason `Pending`.
+- **Approved by a policy-listed identity:** a temporary Pod-bound `Role`/`RoleBinding` is
+  created, the mount appears, the copy proceeds, and the permission is cleaned up when the
+  Pod completes.
+- **Approved — but not by the policy's identities:** the check fails with reason
+  `ApproverMismatch` (`approved, but policy requires N distinct approval(s) from [...]`),
+  the driver mounts an `.error.json` file instead of configuration, and the copy step fails
+  promptly. A pipeline-side approval alone releases nothing.
+- **Rejected:** the pipeline stops at the approval task; the copy step never starts.
+
+Inspect the runtime record in the Connector's namespace:
+
+Replace in this block: `<connector-namespace>`, `<access-request-name>`.
+
+```bash
+kubectl get accessrequests -n <connector-namespace>
+kubectl get accessrequest <access-request-name> -n <connector-namespace> \
+  -o jsonpath='{range .status.policies[*].matchedChecks[*]}{.condition.reason}{": "}{.condition.message}{"\n"}{end}'
+```
+
+With this gate in place the enforcement lives at the credential, not in the pipeline
+definition. The admission guardrails from
+[Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx)
+remain the part that takes work off the approvers — a request that reaches them is already
+known to use the reviewed template and to copy only the approved artifacts.
 
 ## Operation Results
 
@@ -241,12 +756,19 @@ Use this form only when one source image needs one or more destination tags. Use
 - If the approval is rejected, the `PipelineRun` fails and the promotion copy
   does not start.
 - If the approval succeeds, `skopeo-copy` copies each mapping to the destination
-  registry.
+  registry. With the optional gate from
+  [Optional: release the credential only after approval](#connector-approval) in place,
+  one more condition applies: the approval must come from the identities the `AccessPolicy`
+  names, or the credential is withheld and the copy step fails with `ApproverMismatch` on
+  the `AccessRequest`.
 - `skopeo-copy` emits digest-oriented results for successful registry
   destinations, including `IMAGES`, `dst-IMAGE_URL`, `dst-IMAGE_DIGEST`,
   `dst-image-urls`, and `dst-image-tag`.
 
-Use the following commands to inspect the run:
+Use the following commands to inspect the run. They name the Secret-backed example run; for the
+Connector-backed one, substitute `promote-artifacts-prod-connector-run` throughout.
+
+Replace in this block: `<namespace>`.
 
 ```bash
 kubectl get pipelinerun promote-artifacts-prod-run -n <namespace>
@@ -278,20 +800,57 @@ For approval audit details, inspect `status.approversResponse` on the generated
 
 - **Promotion starts without the expected gate:** Confirm the `skopeo-copy` task
   has `runAfter: [wait-for-approval]` or otherwise depends on the approval task.
-- **A run user can change approvers:** Remove approval policy values from
-  `PipelineRun` parameters and keep them in a protected `Pipeline` definition.
+- **A run user can change approvers:** Keep approval policy values out of
+  `PipelineRun` parameters, or deploy the approver guardrail from
+  [Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx)
+  so run-supplied approvers are validated at admission.
 - **Approval task never appears:** Confirm `Manual Approval Gate` is installed
   and ready, then inspect the `CustomRun` and `ApprovalTask` resources.
 - **Registry authentication fails:** Verify that the source and destination
-  secrets contain credentials for the registries used in `imageMappings`.
+  secrets contain credentials for the registries used in `imageMappings`. For a run whose
+  destination workspace is a Connector mount, there is no destination secret to check —
+  verify the `Connector` is `Ready`, and, with the optional gate on, that the
+  `AccessRequest` shows the credential was granted.
+- **The copy Pod stays waiting at volume mount:** With the optional gate in place this is
+  the approval gate working — the `AccessRequest` in the Connector's namespace reports
+  `AccessCheckReady: Unknown / Pending` until the run's `ApprovalTask` is approved. If no
+  `ApprovalTask` exists in the `PipelineRun` at all, the request stays pending until the
+  run times out.
+- **The approval went through but the copy fails immediately (optional gate on):** Read the `AccessRequest`'s
+  check conditions. `ApproverMismatch` means the task was approved, but not by the
+  identities the `AccessPolicy` names — the credential was withheld and the mount carried
+  an `.error.json` marker instead of configuration.
 - **TLS verification fails for an internal registry:** Prefer mounting the
-  correct CA bundle. Set `srcTLSVerify` or `dstTLSVerify` to `"false"` only for a
-  trusted internal registry that intentionally uses insecure access or
-  self-signed certificates.
+  correct CA bundle, and read which side of the copy failed.
+  `x509: certificate signed by unknown authority` on the destination means the
+  `dst-ca-bundle` binding is missing — a Connector-backed run binds the Connector
+  mount to it, and without that the copy sees the Connectors proxy certificate
+  with no matching CA. The same error on the source means the source registry's
+  CA is missing: that hop is tunnelled, so it presents the registry's own
+  certificate and the CA has to come from the run, through `src-ca-bundle`. Set
+  `srcTLSVerify` or `dstTLSVerify` to `"false"` only for a trusted internal
+  registry that intentionally uses insecure access or self-signed certificates, or
+  as the fallback for a template that cannot bind the workspace on that side. The
+  two switches are independent — turning one off says nothing about the other.
+- **The copy fails with `missing key ca.key for client certificate ca.cert`:** A
+  Connector mount was bound as a CA workspace without `!ca.cert` in its
+  `configuration.names`, so `skopeo` picked up the mount's deprecated `ca.cert`
+  alias and read it as a client certificate rather than a CA. Add the exclusion,
+  as the `dst-ca-bundle` binding above does.
 - **Only some mappings were copied:** Inspect the `promote-images` `TaskRun`
   logs. Each `imageMappings` item must contain exactly two references:
   `SRC DST`.
 
 ## Learn More
 
+- [Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx) —
+  admission policies that reserve the production registry Connector for this pipeline and pin
+  what a promotion may copy and where it may land.
 - [Specifying remote tasks using hub resolvers](./specifying_remote_tasks_using_hub_resolvers.mdx)
+- <ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_csi.html" children="Connectors CSI Driver" /> —
+  how a run mounts a Connector and what the mount contains.
+- <ExternalSiteLink name="connectors" href="/connectors/concepts/connectors_approval.html" children="Connectors Approval & Permission Gating" /> —
+  the capability behind the optional credential-release gate, with
+  <ExternalSiteLink name="connectors" href="/connectors/concepts/access_policy.html" children="AccessPolicy" /> and
+  <ExternalSiteLink name="connectors" href="/connectors/concepts/access_request.html" children="AccessRequest" />
+  covering the two resources it is built from.

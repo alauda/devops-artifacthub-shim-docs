@@ -16,11 +16,13 @@ There are two configuration entry points:
 | Source type | Configuration | Reload behavior |
 | --- | --- | --- |
 | ConfigMap-backed Git repository | `repository.yaml.gitRepositories[].repositories[].disabledPackages` | Hot reloaded after ConfigMap changes. |
+| ConfigMap-backed Kubernetes repository | `repository.yaml.kubernetesRepositories[].repositories[].disabledPackages` | Hot reloaded after ConfigMap changes. |
 | Built-in or static filesystem catalog | Helm value `config.disabledPackages` | Requires the chart-managed pod configuration to roll out. |
 
 ## Disable Packages in a ConfigMap Repository
 
-Add `disabledPackages` to the repository ConfigMap.
+Add `disabledPackages` to the repository ConfigMap. The same nested field is
+valid under `kubernetesRepositories[].repositories[]`.
 
 ```yaml
 apiVersion: v1

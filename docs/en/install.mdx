@@ -21,8 +21,14 @@ template-render extension into `artifacthub-shim-system`.
   ACP platform.
 - You have downloaded the Artifact Hub Shim cluster plugin package to the
   operation host.
-- `Alauda DevOps Pipelines` v4.0 or later is installed if the cluster will
-  consume catalog resources through Tekton or Pipelines as Code.
+- A supported `Alauda DevOps Pipelines` release is installed if the cluster
+  will consume catalog resources through Tekton or Pipelines as Code. The
+  current released version is `v4.14.0`. Support on the `4.10`, `4.6`, and
+  `4.0` lines becomes available after `v4.10.2`, `v4.6.4`, and `v4.0.17`.
+- The ACP cluster meets the minimum patch versions documented in
+  [Release Notes](overview/release_notes.mdx). On ACP `4.0` through `4.3`,
+  Artifact Hub Shim `v1.0.0` becomes available after ACP `4.0.13`, `4.1.7`,
+  `4.2.6`, or `4.3.3`. ACP `4.4` and later have no such restriction.
 - You can use `kubectl` with cluster-administrator permissions to verify the
   installation.
 

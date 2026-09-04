@@ -1,0 +1,406 @@
+---
+weight: 35
+category: howto
+---
+
+# Configure Kubernetes catalog sources
+
+`artifacthub-shim` can index Tekton `Task`, `Pipeline`, and `StepAction`
+objects directly from Kubernetes. This is useful when catalog resources are
+managed by GitOps and no separate Git checkout should be maintained.
+
+## Configuration layers
+
+Kubernetes catalog sources are configured in three layers. Each layer is owned
+by a different role and is applied at a different time:
+
+| Layer | When | Who | What it controls |
+| --- | --- | --- | --- |
+| 1. Capability | Install or Helm upgrade | Cluster admin | Chart values under `config.*`. These define whether Kubernetes sources are enabled and which namespaces the shim may read. |
+| 2. Registration | Repository ConfigMap apply | Platform or team admin | Visibility labels or annotations on the ConfigMap, plus `data.repository.yaml`. These define who can consume the catalog and where the shim reads from. |
+| 3. Authoring | Tekton resource apply | Catalog author | `artifacthub-shim.alauda.io/catalog` and `app.kubernetes.io/version` on each `Task`, `Pipeline`, or `StepAction`. These define which objects belong to a catalog. |
+
+Every `config.*` key on this page is a Helm chart value, not a field inside a
+repository ConfigMap. Change those values with `helm upgrade` or, on ACP, with
+`ModuleInfo.spec.config.extraConfigValues`. See
+[Chart Configuration](../configure/chart_configuration.mdx).
+
+Labeling a Tekton resource (layer 3) cannot scope a catalog to a namespace or
+project. Automatic discovery is always global. Use a repository ConfigMap
+(layer 2) when the catalog must be visible only to one namespace or one
+project.
+
+## Prerequisites
+
+- `artifacthub-shim` is installed and ready.
+- `config.kubernetesSources.enabled` is `true`. This is the chart default.
+- `config.enableConfigMapSources` is `true` when you register sources with a
+  ConfigMap.
+- `config.scopedConfigMapSources.enabled` is `true` when the catalog should be
+  visible only to one namespace, one project, or an explicit Namespace
+  allowlist. This is the chart default.
+- The target namespace that stores Tekton resources is either the shim
+  namespace or an entry in `config.kubernetesSources.allowedNamespaces`. The
+  ConfigMap owner namespace is not implicitly allowed.
+- For project visibility, the ConfigMap owner Namespace has a
+  `cpaas.io/project` label. Consumer namespaces in the same project must share
+  that label.
+
+## Share a catalog with a project or one namespace \{#share-a-catalog-with-a-project-or-one-namespace}
+
+This is the copy-paste path for the common task: keep Tekton resources in one
+namespace and let other namespaces in the same project, or only one consumer
+namespace, resolve them.
+
+Replace the example names as needed:
+
+- Shim install namespace: `artifacthub-shim-system`
+- Catalog resource namespace: `team-a-catalog`
+- ConfigMap owner namespace: `team-a`
+- Another consumer namespace in the same project: `team-a-dev`
+- Project identity: `team-a`
+
+### 1. Allow the shim to read the catalog namespace
+
+Cluster administrators add the resource namespace to the Helm allowlist. On
+ACP, put the same keys under `ModuleInfo.spec.config.extraConfigValues` without
+a wrapping `config:` key:
+
+```yaml
+config:
+  kubernetesSources:
+    enabled: true
+    allowedNamespaces:
+      - team-a-catalog
+```
+
+Then upgrade the chart so the shim receives `get/list/watch` Roles in
+`team-a-catalog`.
+
+### 2. Label the Tekton resources
+
+Catalog authors apply both required labels. Quote the version so YAML does not
+parse `1.2` as a float:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: Task
+metadata:
+  name: build
+  namespace: team-a-catalog
+  labels:
+    artifacthub-shim.alauda.io/catalog: team-a-tasks
+    app.kubernetes.io/version: "1.2.3"
+spec:
+  steps:
+    - name: build
+      image: alpine:3.20
+      script: echo build
+```
+
+### 3. Register the source with the intended visibility
+
+Create the repository ConfigMap in a project namespace, not in the shim
+namespace. Set the visibility label explicitly.
+
+Share the catalog with every namespace whose `cpaas.io/project` label equals
+the owner Namespace label:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-a-k8s-catalogs
+  namespace: team-a
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "project"
+data:
+  repository.yaml: |
+    kubernetesRepositories:
+      - namespace: team-a-catalog
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+```
+
+Limit the catalog to the ConfigMap owner namespace only:
+
+```yaml
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: team-a-k8s-catalogs
+  namespace: team-a
+  labels:
+    artifacthub-shim.alauda.io/repository: "true"
+    artifacthub-shim.alauda.io/repository-visibility: "namespace"
+data:
+  repository.yaml: |
+    kubernetesRepositories:
+      - namespace: team-a-catalog
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+```
+
+:::tip
+A repository ConfigMap in the shim namespace defaults to `global`. In any other
+namespace it defaults to `namespace`, meaning only its own namespace can use
+the catalog. To share it with the rest of the project you must set
+`artifacthub-shim.alauda.io/repository-visibility: project` explicitly. Copying
+a shim-namespace example into a team namespace silently changes the default
+from cluster-wide to owner-only; the source can still be Ready while other
+namespaces never resolve it.
+:::
+
+The `name` field is both the externally visible catalog name and the default
+label selector value. With the example above, the shim selects
+`artifacthub-shim.alauda.io/catalog=team-a-tasks` unless `selector` is set.
+
+### 4. Resolve the catalog from a consumer namespace
+
+A TaskRun in `team-a-dev` can use the project-scoped catalog:
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: run-team-a-task
+  namespace: team-a-dev
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: team-a-tasks
+      - name: type
+        value: artifact
+      - name: kind
+        value: task
+      - name: name
+        value: build
+      - name: version
+        value: "1.2.3"
+```
+
+Full visibility options (`global`, `project`, `namespace`, and the explicit
+Namespace allowlist annotation) are documented in
+[catalog visibility](configure_custom_git_repositories.mdx).
+
+## Automatic global catalog in the shim namespace
+
+When you want a cluster-wide catalog and the Tekton resources already live in
+the shim namespace, skip the ConfigMap and use automatic discovery.
+
+The chart's `config.kubernetesSources.enabled` value is enabled by default. In
+the namespace where the shim runs, add the following labels to a resource:
+
+```yaml
+metadata:
+  labels:
+    artifacthub-shim.alauda.io/catalog: team-catalog
+    app.kubernetes.io/version: "1.2.3"
+```
+
+The `catalog` label value is the Artifact Hub catalog name. Every matching
+resource is loaded into a global source automatically. Automatically discovered
+sources are always global and cannot be scoped; use the ConfigMap form in
+[Share a catalog with a project or one namespace](#share-a-catalog-with-a-project-or-one-namespace)
+if you need namespace or project scoping. Automatic discovery also scans only
+the shim namespace.
+
+The version label is required and represents the current catalog version;
+Kubernetes resources are not retained as historical versions. Removing the
+catalog label disables the resource on the next watch or periodic refresh.
+
+A malformed resource is skipped with a Warning while valid resources in the
+same source continue to be served. If every matched resource is invalid, the
+whole source fails with a permanent error instead of serving an empty catalog,
+and last-good content is not reused.
+
+Use the generated catalog name for the matching Tekton Hub resolver kind.
+Catalog names are case-insensitively unique across Task, Pipeline, and
+StepAction sources, so do not reuse one label value for different kinds. The
+resolver still uses the explicit `kind` parameter to select the resource type.
+For example, a TaskRun can resolve an automatically discovered Task:
+
+```yaml
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: team-catalog
+      - name: type
+        value: artifact
+      - name: kind
+        value: task
+      - name: name
+        value: build
+      - name: version
+        value: "1.2.3"
+```
+
+The same `catalog`, `type`, `kind`, `name`, and `version` parameters are used
+for PipelineRun `pipelineRef` and StepAction references in a TaskRun.
+
+There is no separate `globalSources` list. The catalog label is the explicit
+enable/disable contract for resources in the shim namespace, which avoids
+duplicating resource names in Helm configuration.
+
+## ConfigMap-defined sources
+
+Use a repository ConfigMap when the source namespace is different from the
+shim namespace, when a custom selector is required, or when the catalog must
+not be global.
+
+If `namespace` is omitted under `kubernetesRepositories[]`, it defaults to the
+namespace that owns the repository ConfigMap. This default does not bypass
+`config.kubernetesSources.allowedNamespaces`: a target outside the shim
+namespace still needs to be listed explicitly.
+
+The `repository.yaml` schema is decoded strictly while Kubernetes sources are
+enabled, so unknown fields such as `matchLabel` are rejected. During a chart
+upgrade, setting `config.kubernetesSources.enabled=false` ignores the complete
+`kubernetesRepositories` section while Git repositories in the same ConfigMap
+remain active.
+
+When `selector` is omitted, the shim uses
+`artifacthub-shim.alauda.io/catalog=<the entry's name field>`. `name` is both
+the externally visible catalog name and that default label value. An explicit
+selector on the same `repositories[]` entry replaces this default:
+
+```yaml
+    kubernetesRepositories:
+      - namespace: team-a-catalog
+        repositories:
+          - name: team-a-tasks
+            displayName: Team A Tasks
+            kind: task
+            selector:
+              matchLabels:
+                catalog.example.com/team: team-a
+              matchExpressions:
+                - key: catalog.example.com/enabled
+                  operator: In
+                  values: ["true"]
+```
+
+`selector: {}` intentionally matches every resource of the selected kind in the
+target namespace and should be used with care.
+
+The target namespace must be the shim namespace or be listed in
+`config.kubernetesSources.allowedNamespaces`; this Helm setting controls Tekton
+resource reads and is independent from
+`config.globalConfigMapSources.allowedNamespaces`, which controls which
+namespaces may register globally visible repository ConfigMaps.
+
+### Field reference
+
+Supported top-level `repository.yaml` fields for this source type:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `kubernetesRepositories` | No | List of Kubernetes sources to register from this ConfigMap. Git repositories may still be declared in the same file. |
+
+Supported `kubernetesRepositories[]` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `namespace` | No | Namespace that stores the Tekton resources. Defaults to the ConfigMap owner namespace. Must be the shim namespace or listed in `config.kubernetesSources.allowedNamespaces`. |
+| `repositories` | Yes | Catalog entries selected from that namespace. |
+
+Supported `kubernetesRepositories[].repositories[]` fields:
+
+| Field | Required | Description |
+| --- | --- | --- |
+| `name` | Yes | Stable catalog name used by resolver and API paths, and the default `artifacthub-shim.alauda.io/catalog` label value. |
+| `displayName` | No | Human-readable catalog name. |
+| `kind` | Yes | One of `task`, `pipeline`, or `stepaction`. |
+| `selector` | No | Optional Kubernetes label selector. Omitted uses `artifacthub-shim.alauda.io/catalog=<name>`. `selector: {}` matches every resource of that kind. |
+| `disabledPackages` | No | Repository-local package or version disable rules. See [Disable Catalog Packages](disable_catalog_packages.mdx). |
+| `legacyCatalogAliases` | No | Historical catalog names that resolve to this repository for the same `kind`. API responses still return the canonical `name`. |
+
+## RBAC and refresh behavior
+
+The chart grants `get/list/watch` for Tekton resources in the shim namespace.
+For each namespace in `config.kubernetesSources.allowedNamespaces`, it renders
+a namespaced Role and RoleBinding with the same verbs. No cluster-wide Tekton
+read permission is created by default. If an operator manages RBAC separately,
+grant the same permissions to the shim ServiceAccount.
+
+Resource watch events trigger a refresh; a periodic refresh remains as a
+fallback for missed events or API watch restarts. Inspect source status and
+the pod logs for the catalog name, kind, target namespace, selector, warnings,
+and last refresh time. If a source is not visible, verify the version label,
+the target-namespace allowlist, selector syntax, ServiceAccount RBAC, and
+[catalog visibility](configure_custom_git_repositories.mdx).
+
+When a Kubernetes API List temporarily fails, the last successful automatic
+discovery for the affected kind remains available and that source status becomes
+`Degraded`; other kinds continue refreshing. A permanent API or permission
+failure removes only the affected automatic kind until discovery succeeds again.
+Setting
+`config.kubernetesSources.enabled=false` disables both automatic label
+discovery and ConfigMap `kubernetesRepositories`; Git repositories continue to
+work.
+
+## Source uniqueness and priority
+
+Catalog names are case-insensitively unique across all supported kinds and
+competing sources.
+
+Duplicate handling has two steps:
+
+1. Refresh first selects one winner per catalog name. Source priority is
+   built-in catalog, then ConfigMap sources owned by the shim namespace, then
+   ConfigMap sources owned by other namespaces, then automatic label discovery;
+   lexical source identity breaks ties within one tier. An explicit ConfigMap
+   source always outranks automatic discovery of the same catalog name.
+2. After that selection, any remaining collision is marked Invalid rather than
+   merged.
+
+These two steps are independent. Priority chooses the surviving source; a
+duplicate that still collides after that choice is rejected.
+
+## Verification
+
+After applying the Tekton resources and optional repository ConfigMap, inspect
+the ConfigMap Events when you used the ConfigMap form:
+
+```bash
+kubectl describe configmap team-a-k8s-catalogs -n team-a
+```
+
+Expected Events:
+
+- `RepositoryConfigAccepted` means `repository.yaml` was accepted.
+- `RepositorySourceReady` means the Kubernetes source was indexed and is now
+  visible to the consumers allowed by its visibility scope.
+
+You can also list recent repository ConfigMap Events directly:
+
+```bash
+kubectl get events -n team-a \
+  --field-selector involvedObject.kind=ConfigMap,involvedObject.name=team-a-k8s-catalogs
+```
+
+Confirm the labeled resources exist in the target namespace:
+
+```bash
+kubectl get task,pipeline,stepaction -n team-a-catalog --show-labels
+```
+
+If the source is not visible, start with
+[Troubleshoot repository source visibility](../trouble_shooting/repository_source_not_visible.mdx).
+
+## Learn More
+
+- [Configure Custom Git Repositories](configure_custom_git_repositories.mdx)
+- [Disable Catalog Packages](disable_catalog_packages.mdx)
+- [Chart Configuration](../configure/chart_configuration.mdx)
+- [Troubleshoot repository source visibility](../trouble_shooting/repository_source_not_visible.mdx)
+- [Consume Resources with the Hub Resolver](consume_resources_with_hub_resolver.mdx)
