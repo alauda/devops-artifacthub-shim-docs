@@ -249,6 +249,42 @@ reviewers:
   - devops-reviewer
 ```
 
+### Change a Published Version \{#change-a-published-version}
+
+A published version directory is not frozen. When the manifest or the
+`README.md` of an existing `<kind>/<name>/<version>/` directory changes in the
+source, the shim serves the new content after its next refresh. These are the
+only two files the shim serves for a version; other files in the directory,
+such as `samples/` and `OWNERS`, are not served as version content. Refreshes run every
+`config.refreshInterval` (default `10m`, set through the
+`ARTIFACTHUB_SHIM_REFRESH_INTERVAL` environment variable; see
+[Chart Configuration](../../configure/chart_configuration.mdx)). A repository
+ConfigMap or Secret event starts one after the event debounce window
+(`config.repositoryEventDebounce`, default `2s`); a Kubernetes catalog source
+event requests one directly, without that window. Each refresh fetches Git sources again, rebuilds the whole index,
+and atomically replaces the served snapshot. The shim does not compare a
+version with the previous snapshot, so it neither rejects nor reports an
+in-place change. The `digest` reported for a version is the SHA-256 of its
+manifest: it changes when the manifest changes, and stays the same for a
+README-only change. Resolver requests for that `name` and `version` receive
+the new content after the refresh. Each replica refreshes on its own. When a
+source fails to load with a transient error, the replica keeps serving that
+source's last successfully loaded content only if it has loaded the source
+successfully before and the source configuration has not changed since;
+otherwise the source is reported as invalid.
+
+Treat a published version as final. To fix or change a released resource,
+publish a new version directory and update the references to it. To freeze
+the files of a Git source, set its `revision` to a commit instead of a branch.
+This freezes only that source's files: which versions the shim serves still
+depends on the catalog configuration, such as repositories added or removed
+through repository ConfigMaps or Kubernetes catalog sources, and
+`config.disabledPackages` rules (see [Chart
+Configuration](../../configure/chart_configuration.mdx)). A Git source
+pinned to a commit serves only what that commit contains, so after you
+publish a new version directory, also move the source's `revision` to a
+commit that contains it; otherwise the new version is not served.
+
 ## Use Resources with the Hub Resolver
 
 For `artifacthub-shim`, set the resolver type to `artifact`. The `catalog`
@@ -321,10 +357,43 @@ The main resolver parameters are:
 | `catalog` | Yes for custom repositories | The configured repository name. |
 | `kind` | Yes when the resolver cannot infer it | `task`, `pipeline`, or `stepaction`. |
 | `name` | Yes | The package name. |
-| `version` | No | An exact version or supported version constraint; the latest compatible version is selected when omitted. |
+| `version` | Yes | An exact version or supported version constraint; the hub resolver rejects a reference without it (`missing required hub resolver params: version`). |
 
 For the complete resolver configuration and troubleshooting guidance, see
 [Consume Resources with the Hub Resolver](../../how_to/consume_resources_with_hub_resolver.mdx).
+
+## Recommended Settings
+
+**When to enable.** Use a shared catalog when several projects need the same
+build, scan, or delivery steps.
+
+**Recommended values.** Register the catalog as one Git repository entry, with
+one stable repository name per kind, as described in [Configure Custom Git
+Repositories](../../how_to/configure_custom_git_repositories.mdx): add one
+nested `repositories` entry with `kind: task` and another with `kind: pipeline`,
+because each nested entry declares exactly one `kind` and its `name` becomes the
+`catalog` parameter that resolver references use. Keep the
+`task/<name>/<version>/<name>.yaml` and `pipeline/<name>/<version>/<name>.yaml`
+paths from Catalog Directory Layout. Publish a new version directory whenever a
+resource contract or behavior changes, following Initialize and Version a
+Catalog. Keep every resource self-contained for air-gapped runs: resolve Tasks
+and Pipelines from this catalog through the hub resolver, and reference step
+images from the private registry that serves the environment (see [Built-in
+Tool Images Selection Guide](../reference/tool_images.mdx)), or pin them by
+digest. Require review before publishing: list `approvers` and `reviewers` in
+the root `OWNERS` file and pass the Validation Checklist below for every
+version. In resolver references, set `type: artifact`, the `catalog` name
+configured for the resource's kind, and an explicit `version`, because the hub
+resolver rejects a reference without `version`
+(`missing required hub resolver params: version`).
+
+**Prerequisites.** `artifacthub-shim` is installed with
+`config.enableConfigMapSources` set to `true` so that Git sources can be
+registered. The Tekton hub resolver is enabled and points to the shim, as
+described in [Consume Resources with the Hub
+Resolver](../../how_to/consume_resources_with_hub_resolver.mdx). The Git server
+that hosts the catalog is reachable from the cluster, and every step image the
+catalog references is available in the environment's registry.
 
 ## Validation Checklist
 
