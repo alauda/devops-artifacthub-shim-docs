@@ -69,6 +69,44 @@ metadata:
 
 `spec.description` 和同版本目录中的 `README.md` 继续作为 UI/API 展示内容来源。manifest 中已有的 `style.tekton.dev/descriptors` 必须原样保留；`artifacthub-shim` 不会重写动态表单，也不会把 descriptor 自动迁移成新的 schema。
 
+## Compliance display boundary
+
+The current product display name is `Alauda Container Platform Pipelines`.
+Resolver source names (`catalog`, `catalog-pipelines`, and `catalog-stepactions`),
+Tekton API kinds, image references, and `tektoncd-operator` identifiers remain
+technical compatibility values and must not be renamed as part of this change.
+
+`artifacthub-shim` returns catalog descriptions, READMEs, annotations, and icon
+data as authored by the catalog. It does not inject trademark text or rewrite
+third-party artwork at runtime. The catalog owns manifest metadata and neutral
+icons; the pipeline frontend and Operator repositories own page footers,
+Operator Bundle fields, and console assets. This boundary keeps offline API
+responses deterministic and prevents a runtime shim update from silently
+changing published catalog content.
+
+The naming review follows the same boundary:
+
+| Surface | Decision |
+| --- | --- |
+| Documentation site title, Helm maintainer, and Hub OpenAPI title | Use `Alauda Container Platform Pipelines` or the neutral `Alauda` organization name. |
+| `ACP DevOps 4.14` in the current integration guide | Replace it with `Alauda Container Platform Pipelines 4.14`; do not retain the former versioned shorthand as the current product display name. |
+| Chart and Cluster Plugin description fields | Use neutral resource wording such as `Task`, `Pipeline`, and `StepAction`; keep the complete trademark attribution in the user-documentation note instead of embedding a multi-line legal notice in a single metadata field. |
+| `Alauda DevOps UI`, `ACP DevOps UI`, and `Alauda DevOps Connectors` | Retain as names of separately owned components referenced by the API and integration contracts. |
+| `tektoncd-operator`, resolver source names, API kinds, image paths, and historical design text | Retain as technical or historical identifiers; they are not current product display names. |
+
+User-facing installation, integration, quick-start, and release documents carry
+the required trademark attribution text. The shim does not inject that text
+into catalog API responses.
+
+Before publishing a catalog image, run the catalog-side
+`make verify-artifacthub-shim-metadata` gate and `make verify-rendered-tasks`.
+The metadata gate checks YAML validity, Artifact Hub license/category
+annotations, non-empty package `README.md` and manifest `spec.description`,
+import labels, and retired product-name references without network access.
+`make verify-rendered-tasks` separately checks authored template and rendered
+manifest parity. Icon provenance is documented by catalog resources; neither
+gate requires one shared icon, a logo-signature allowlist, or icon unit tests.
+
 ## Artifact Hub 元数据文件
 
 `artifacthub-repo.yml` 对当前 `artifacthub-shim` 是可选文件。shim 的 filesystem provider 会跳过 source 根目录下的普通文件，只扫描 package/version 目录；repository 名称、展示名称和 kind 均来自 source 配置。

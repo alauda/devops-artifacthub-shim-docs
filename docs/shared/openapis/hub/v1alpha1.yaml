@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: Alauda DevOps Hub API
+  title: Alauda Container Platform Pipelines Hub API
   version: v1alpha1
   description: >-
     The Hub API lists and retrieves Tekton Tasks, Pipelines, and StepActions
