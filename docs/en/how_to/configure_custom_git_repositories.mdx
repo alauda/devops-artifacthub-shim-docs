@@ -64,6 +64,26 @@ stepaction/
       echo-message.yaml
 ```
 
+Each version may also include localized documentation files named
+`README.<lang>.md`, such as `README.zh.md`, `README.fr.md`, or
+`README.zh-CN.md`. The exact filename `README.md` remains the canonical English
+file; case variants such as `readme.md` and `README.en.md` are only compatibility
+fallbacks when the canonical file is absent. Unused compatibility aliases do not
+affect loading; each selected README must be a regular file, not a symbolic link,
+and must satisfy the configured README size limit. The `artifacthub-shim` UI API
+selects localized files with the optional `lang` query parameter while keeping
+the resource path unchanged:
+
+```text
+GET /api/v1alpha1/team-a-tasks/task/run-script/0.1?lang=zh
+```
+
+Without `lang`, the API returns `README.md`. If the requested file is absent,
+the API first tries the base language (for example, `zh-CN` can use
+`README.zh.md`) and then falls back to `README.md`. Keep the English file in
+each published version for backward compatibility. The resolver-facing
+`/api/v1/packages/**` API always returns the English README.
+
 For each version directory, `artifacthub-shim` first looks for
 `<package>.yaml` or `<package>.yml`. If neither exists, it falls back to the
 single Tekton YAML file whose Kubernetes `kind` matches the configured source

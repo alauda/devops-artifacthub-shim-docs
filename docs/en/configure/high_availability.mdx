@@ -15,7 +15,9 @@ Each replica is an independent read server:
 
 - It watches the same repository configuration.
 - It refreshes catalog sources into its own source work directory.
-- It builds and publishes its own immutable read snapshot.
+- It builds and atomically publishes its own read snapshot. A published
+  snapshot is never modified in place; each refresh replaces it with a newly
+  built one, so a version's content can change between refreshes.
 - It serves requests only after its first snapshot is ready.
 
 This model provides read redundancy and read traffic distribution. It does not

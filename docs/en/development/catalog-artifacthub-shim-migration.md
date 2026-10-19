@@ -7,7 +7,7 @@
 
 ## 目录结构改造
 
-资源版本目录遵循 `{kind}/{name}/{version}/{name}.yaml`。同目录必须放置 `README.md`，作为 UI 和 API 展示该版本说明的来源。
+资源版本目录遵循 `{kind}/{name}/{version}/{name}.yaml`。同目录应放置 `README.md`，作为默认英文 UI 和 API 展示该版本说明的来源。
 
 推荐结构：
 
@@ -28,6 +28,27 @@ stepaction/
       README.md
       echo-message.yaml
 ```
+
+### 多语言 README
+
+每个版本目录可以在英文 README 外增加任意语言的 README，文件名使用
+`README.<lang>.md`，例如 `README.zh.md`、`README.fr.md` 或
+`README.zh-CN.md`。语言标签不区分大小写，服务端会统一转换为小写并使用
+`-` 作为分隔符。
+
+UI API 通过可选的 `lang` 查询参数选择 README，资源路径保持不变：
+
+```text
+GET /api/v1alpha1/catalog/task/run-script/0.1?lang=zh
+```
+
+未传 `lang` 时返回 `README.md`。请求的语言文件不存在时，服务端会先尝试
+基础语言（例如 `zh-CN` 回退到 `zh`），再回退到英文 README。README 缺失时
+仍按原有行为返回空内容。Artifact Hub resolver 使用的 `/api/v1/packages/**`
+接口固定返回英文 README，不受 `lang` 参数影响。
+
+请始终保留 `README.md`，这样不支持语言选择的旧客户端和未知语言请求仍能
+获得可读的英文说明。新增其他语言文件不需要修改 artifacthub-shim API。
 
 当前 `artifacthub-shim` 不要求也不读取 `artifacthub-repo.yml`。内置 catalog 的 resolver-facing repository 名称来自 shim source 配置，而不是目录中的 metadata 文件：
 
@@ -68,6 +89,44 @@ metadata:
 ```
 
 `spec.description` 和同版本目录中的 `README.md` 继续作为 UI/API 展示内容来源。manifest 中已有的 `style.tekton.dev/descriptors` 必须原样保留；`artifacthub-shim` 不会重写动态表单，也不会把 descriptor 自动迁移成新的 schema。
+
+## Compliance display boundary
+
+The current product display name is `Alauda Container Platform Pipelines`.
+Resolver source names (`catalog`, `catalog-pipelines`, and `catalog-stepactions`),
+Tekton API kinds, image references, and `tektoncd-operator` identifiers remain
+technical compatibility values and must not be renamed as part of this change.
+
+`artifacthub-shim` returns catalog descriptions, READMEs, annotations, and icon
+data as authored by the catalog. It does not inject trademark text or rewrite
+third-party artwork at runtime. The catalog owns manifest metadata and neutral
+icons; the pipeline frontend and Operator repositories own page footers,
+Operator Bundle fields, and console assets. This boundary keeps offline API
+responses deterministic and prevents a runtime shim update from silently
+changing published catalog content.
+
+The naming review follows the same boundary:
+
+| Surface | Decision |
+| --- | --- |
+| Documentation site title, Helm maintainer, and Hub OpenAPI title | Use `Alauda Container Platform Pipelines` or the neutral `Alauda` organization name. |
+| `ACP DevOps 4.14` in the current integration guide | Replace it with `Alauda Container Platform Pipelines 4.14`; do not retain the former versioned shorthand as the current product display name. |
+| Chart and Cluster Plugin description fields | Use neutral resource wording such as `Task`, `Pipeline`, and `StepAction`; keep the complete trademark attribution in the user-documentation note instead of embedding a multi-line legal notice in a single metadata field. |
+| `Alauda DevOps UI`, `ACP DevOps UI`, and `Alauda DevOps Connectors` | Retain as names of separately owned components referenced by the API and integration contracts. |
+| `tektoncd-operator`, resolver source names, API kinds, image paths, and historical design text | Retain as technical or historical identifiers; they are not current product display names. |
+
+User-facing installation, integration, quick-start, and release documents carry
+the required trademark attribution text. The shim does not inject that text
+into catalog API responses.
+
+Before publishing a catalog image, run the catalog-side
+`make verify-artifacthub-shim-metadata` gate and `make verify-rendered-tasks`.
+The metadata gate checks YAML validity, Artifact Hub license/category
+annotations, non-empty package `README.md` and manifest `spec.description`,
+import labels, and retired product-name references without network access.
+`make verify-rendered-tasks` separately checks authored template and rendered
+manifest parity. Icon provenance is documented by catalog resources; neither
+gate requires one shared icon, a logo-signature allowlist, or icon unit tests.
 
 ## Artifact Hub 元数据文件
 

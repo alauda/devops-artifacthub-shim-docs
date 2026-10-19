@@ -1,6 +1,6 @@
 openapi: 3.0.3
 info:
-  title: Alauda DevOps Hub API
+  title: Alauda Container Platform Pipelines Hub API
   version: v1alpha1
   description: >-
     The Hub API lists and retrieves Tekton Tasks, Pipelines, and StepActions
@@ -39,6 +39,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
         - $ref: '#/components/parameters/IncludeContent'
         - $ref: '#/components/parameters/Offset'
         - $ref: '#/components/parameters/Limit'
@@ -107,6 +108,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
       requestBody:
         $ref: '#/components/requestBodies/TaskBatchRequest'
       responses:
@@ -142,6 +144,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
         - $ref: '#/components/parameters/IncludeContent'
         - $ref: '#/components/parameters/Offset'
         - $ref: '#/components/parameters/Limit'
@@ -175,6 +178,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
       requestBody:
         $ref: '#/components/requestBodies/PipelineBatchRequest'
       responses:
@@ -210,6 +214,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
         - $ref: '#/components/parameters/IncludeContent'
         - $ref: '#/components/parameters/Offset'
         - $ref: '#/components/parameters/Limit'
@@ -243,6 +248,7 @@ paths:
         - bearerAuth: []
       parameters:
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
       requestBody:
         $ref: '#/components/requestBodies/StepActionBatchRequest'
       responses:
@@ -281,6 +287,7 @@ paths:
         - $ref: '#/components/parameters/Kind'
         - $ref: '#/components/parameters/Name'
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
       responses:
         '200':
           $ref: '#/components/responses/HubResource'
@@ -317,6 +324,7 @@ paths:
         - $ref: '#/components/parameters/Name'
         - $ref: '#/components/parameters/Version'
         - $ref: '#/components/parameters/Namespace'
+        - $ref: '#/components/parameters/Language'
       responses:
         '200':
           $ref: '#/components/responses/HubResource'
@@ -399,6 +407,21 @@ components:
         maxLength: 63
         pattern: '^[a-z0-9]([-a-z0-9]*[a-z0-9])?$'
       example: team-a
+    Language:
+      name: lang
+      in: query
+      required: false
+      description: >-
+        README language requested by the caller. The value is normalized as a
+        lowercase BCP 47-style tag (underscore is treated as a hyphen), for
+        example `zh` or `zh-CN`. If the requested README is unavailable, the
+        API tries progressively shorter parent tags and then the canonical
+        English `README.md`. Omitted, empty, or malformed values use English
+        without rejecting the request. This parameter affects UI resource list, detail, and batch
+        endpoints only; Artifact Hub package resolver APIs remain English.
+      schema:
+        type: string
+        example: zh-CN
     IncludeContent:
       name: includeContent
       in: query

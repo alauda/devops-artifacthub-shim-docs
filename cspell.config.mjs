@@ -5,6 +5,7 @@ export default {
   words: [
     ...(defaultConfig.words || []),
     'alauda',
+    'cicd',
     'artifacthub',
     'Artifacthub',
     'ConfigMap',
@@ -13,6 +14,10 @@ export default {
     'StepActions',
     'Tekton',
     'tekton',
+    'Kyverno',
+    'kyverno',
+    'trivy',
+    'sonarqube',
     'TaskRun',
     'TaskRuns',
     'PipelineRun',

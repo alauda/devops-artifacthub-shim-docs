@@ -1,0 +1,811 @@
+---
+weight: 35
+category: howto
+---
+
+# Constrain Catalog Pipeline Usage with Kyverno
+
+This page shows a practical policy set for the `java-image-build-scan-deploy` Pipeline
+version `0.3` delivered by ArtifactHub Shim through the `catalog-pipelines` catalog. The
+component exposes the Pipeline and its pinned Tasks through the hub resolver. This is
+intentionally a focused example, not a policy matrix for every Catalog Task and Pipeline.
+
+In the Catalog UI, select this Pipeline and version `0.3` and compare its Task versions
+with the table below. The resource version visible to users is the applicability anchor.
+If your ArtifactHub Shim release does not expose this version, do not use the examples
+unchanged.
+
+Start with the generic Tekton mechanism guide in <ExternalSiteLink name="alauda-devops-pipelines"
+href="/pipelines/how_to/constrain_pipeline_execution_with_kyverno.html"
+children="Constrain Tekton Pipeline Execution with Kyverno" />. That companion page
+explains what Kyverno can observe across Tekton admission, resolution, Pod creation, and
+status updates, as well as inline-spec protection, image admission, rollout, and
+exceptions. Read it to understand the purpose and control boundaries of the policies
+below; this page then applies that mechanism to one concrete CI Pipeline with
+Catalog-specific values, parameters, and result contracts. The design rationale is in
+[Pipeline Policy Constraints with Tekton and Kyverno](https://github.com/alauda/knowledge/blob/main/docs/en/solutions/Pipeline_Policy_Constraints_with_Tekton_and_Kyverno.md).
+
+## The example contract
+
+The Pipeline is referenced through the hub resolver. Resolver parameters belong under
+`pipelineRef`; Pipeline parameters belong under `spec.params`. The following is an
+**admission-only example**. `PipelineRunPending` prevents execution; running a build also
+requires repository, output image, workspace, credential, and offline scanner configuration.
+
+```yaml
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: java-policy-example
+spec:
+  status: PipelineRunPending
+  pipelineRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: catalog-pipelines
+      - name: kind
+        value: pipeline
+      - name: name
+        value: java-image-build-scan-deploy
+      - name: version
+        value: "0.3"
+  params:
+    - name: sonarURL
+      value: https://sonarqube.example.com
+    - name: skipTrivyScan
+      value: "false"
+    - name: trivyExitCode
+      value: "1"
+```
+
+The resolver `type` parameter is optional and is intentionally omitted here so the hub
+resolver uses its default for the delivered Catalog.
+
+The `0.3` Pipeline resolves these Task versions. Keep this small table as an upgrade
+anchor, not as a promise that other Catalog resources have the same contract.
+
+| Catalog Task | Version | Why it matters to a policy |
+| --- | --- | --- |
+| `git-clone` | `0.10` | Source acquisition and TLS behavior. |
+| `maven` | `0.6` | Java build parameters and workspaces. |
+| `sonarqube-scanner` | `0.7` | Code-quality result and quality-gate parameters. |
+| `buildah` | `0.10` | Image build and push. |
+| `trivy-scanner` | `0.6` | Structured vulnerability summary and exit code. |
+| `kubectl` | `0.1` | Optional workload update. |
+
+The policy-relevant Pipeline parameters are:
+
+| Parameter | Type and default | What a platform policy may decide |
+| --- | --- | --- |
+| `skipTrivyScan` | string, default `"false"` | Reject an explicit value other than `"false"` when scans are mandatory. |
+| `trivySeverity` | array, default `[]` | Empty uses Trivy's default severity set; restricting it can hide findings from the gate and summary. |
+| `trivyExitCode` | string, default `"1"` | Keep a non-zero exit code when findings must fail the Pipeline. |
+| `trivyExtraArgs` | array, default `[]` | Allow approved offline database arguments while rejecting overrides that weaken the scan gate. |
+| `sonarURL` | string, default `""` | Reject an empty value when code scanning is mandatory. |
+| `images` | array, required | Restrict output destinations with a PipelineRun parameter policy and registry permissions, not the execution-Pod image policy. |
+| `workloadName` | string, default `""` | Decide whether this Pipeline may update a workload. |
+
+The Pipeline's internal Task references are resolved after the `PipelineRun` request is
+admitted. A `PipelineRun` policy can protect the resolver identity, but it cannot inspect
+the fetched Pipeline body at that admission point. Use Catalog review for the Task pins,
+the generic Pod policy for final images, and the status audit below for execution results.
+
+The Pipeline task names `build-image` and `deploy-or-upgrade` reference the `buildah` and
+`kubectl` Tasks respectively. The `sonarqube-scanner` 0.7 Task defaults both
+`enableScanQualityGate` and `enableAnalyzeQualityGate` to `"true"`; the Pipeline does not
+expose either switch. The Task writes `sonar.qualitygate.wait` after merging properties
+and validates the server-side gate during analysis. Requiring `sonarURL` keeps its `when`
+condition enabled, but does not establish trust in an arbitrary server: restrict server
+URLs, credentials, and scan configuration separately when that is part of your threat model.
+
+### Choose the controls
+
+| Desired outcome | Scenario | What users see |
+| --- | --- | --- |
+| Only run resources from the built-in official Hub catalogs | 1 | Wrong resolver, catalog, kind, Hub URL, or type is rejected. |
+| Keep code and vulnerability checks enabled | 2 | Scan skips and unsafe Trivy overrides are rejected. |
+| Record missing or unacceptable scan evidence | 3 | A PolicyReport violation; execution is not blocked by the audit. |
+
+Replace `<governed-namespace>` in every policy. Use the companion guide's apply/wait
+procedure, first setting every rule's `validate.failureAction` to `Audit`, then to `Enforce`
+for all rules in scenarios 1 and 2. Keep every rule in scenario 3 in `Audit`. These examples
+use the rule-level field; the older policy-level `spec.validationFailureAction` is
+deprecated. Do not change shared policies outside your disposable namespace to run the tests.
+
+## Scenario 1: allow only the official Hub catalog Task and Pipeline sources
+
+**Use case:** users may execute any Task from the built-in Hub catalog named `catalog` and
+any Pipeline from the built-in Hub catalog named `catalog-pipelines`. They cannot switch to
+another resolver, catalog, resource kind, Hub URL, or resolver type. Resource names and
+versions remain open so the catalogs can evolve without changing this namespace policy.
+
+**Enforcement point:** `TaskRun` and `PipelineRun` admission. A wrong reference is rejected
+before the resolver fetches a resource. This also covers TaskRuns created by an approved
+Pipeline: each child TaskRun must point to the built-in Task catalog.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: catalog-official-hub-resources-only
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: allow-only-official-catalog-task
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+              namespaces:
+                - <governed-namespace>
+      context:
+        - name: taskRefParams
+          variable:
+            jmesPath: "(request.object.spec.taskRef.params || `[]`)"
+        - name: taskRefUrlCount
+          variable:
+            jmesPath: "length(taskRefParams[?name=='url'])"
+        - name: taskRefTypeIsArtifact
+          variable:
+            jmesPath: "length(taskRefParams[?name=='type']) == `0` || (length(taskRefParams[?name=='type']) == `1` && (taskRefParams[?name=='type'].value | [0]) == 'artifact')"
+      validate:
+        failureAction: Enforce
+        message: "TaskRuns in this namespace must use the hub resolver with catalog `catalog` and kind task."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.taskRef.resolver || '' }}"
+                operator: NotEquals
+                value: hub
+              - key: "{{ request.object.spec.taskRef.params[?name=='catalog'].value | [0] || '' }}"
+                operator: NotEquals
+                value: catalog
+              - key: "{{ request.object.spec.taskRef.params[?name=='kind'].value | [0] || '' }}"
+                operator: NotEquals
+                value: task
+              - key: "{{ taskRefUrlCount }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ taskRefTypeIsArtifact }}"
+                operator: Equals
+                value: false
+    - name: allow-only-official-catalog-pipeline
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              namespaces:
+                - <governed-namespace>
+      context:
+        - name: pipelineRefParams
+          variable:
+            jmesPath: "(request.object.spec.pipelineRef.params || `[]`)"
+        - name: pipelineRefUrlCount
+          variable:
+            jmesPath: "length(pipelineRefParams[?name=='url'])"
+        - name: pipelineRefTypeIsArtifact
+          variable:
+            jmesPath: "length(pipelineRefParams[?name=='type']) == `0` || (length(pipelineRefParams[?name=='type']) == `1` && (pipelineRefParams[?name=='type'].value | [0]) == 'artifact')"
+      validate:
+        failureAction: Enforce
+        message: "PipelineRuns in this namespace must use the hub resolver with catalog `catalog-pipelines` and kind pipeline."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.pipelineRef.resolver || '' }}"
+                operator: NotEquals
+                value: hub
+              - key: "{{ request.object.spec.pipelineRef.params[?name=='catalog'].value | [0] || '' }}"
+                operator: NotEquals
+                value: catalog-pipelines
+              - key: "{{ request.object.spec.pipelineRef.params[?name=='kind'].value | [0] || '' }}"
+                operator: NotEquals
+                value: pipeline
+              - key: "{{ pipelineRefUrlCount }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ pipelineRefTypeIsArtifact }}"
+                operator: Equals
+                value: false
+```
+
+This policy protects the resolver coordinates, not the fetched YAML. Keep the ArtifactHub
+Shim catalogs and their release process restricted with RBAC and review. The policy
+allows omitted `type` only because the cluster resolver must default to `artifact`; use
+`type: artifact` explicitly if that default is not guaranteed. A request-level `url` is
+always rejected so the same catalog name cannot be redirected to another Hub.
+
+## Scenario 2: keep SonarQube and Trivy gates enabled
+
+**Use case:** a user may change normal build inputs, but cannot explicitly skip Trivy,
+disable the default Trivy failure code, narrow its default severity set, or omit the
+SonarQube URL. The example allows omission or an empty array for `trivySeverity`. For
+`trivyExtraArgs`, it allows only the database options listed below, so offline scans can
+keep the same failure gate.
+
+Pipeline `0.3` does not expose the Task's `skipDbUpdate`, `skipJavaDbUpdate`,
+`dbRepository`, or `javaDbRepository` parameters. Pass these settings through
+`trivyExtraArgs`, one complete argument per array item. Replace the two repository
+references in the policy and examples with your approved internal database mirrors.
+
+**Enforcement point:** `PipelineRun` admission. Omitted parameters retain the Pipeline's
+reviewed defaults; explicit overrides are checked here.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: catalog-java-quality-gates
+spec:
+  background: false
+  webhookConfiguration:
+    failurePolicy: Fail
+  rules:
+    - name: quality-gates-must-stay-enabled
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/PipelineRun
+              namespaces:
+                - <governed-namespace>
+      preconditions:
+        all:
+          - key: "{{ request.object.spec.pipelineRef.resolver || '' }}"
+            operator: Equals
+            value: hub
+          - key: "{{ request.object.spec.pipelineRef.params[?name=='catalog'].value | [0] || '' }}"
+            operator: Equals
+            value: catalog-pipelines
+          - key: "{{ request.object.spec.pipelineRef.params[?name=='kind'].value | [0] || '' }}"
+            operator: Equals
+            value: pipeline
+          - key: "{{ request.object.spec.pipelineRef.params[?name=='name'].value | [0] || '' }}"
+            operator: Equals
+            value: java-image-build-scan-deploy
+          - key: "{{ request.object.spec.pipelineRef.params[?name=='version'].value | [0] || '' }}"
+            operator: Equals
+            value: "0.3"
+      validate:
+        failureAction: Enforce
+        message: "Java Pipeline 0.3 must keep SonarQube and the Trivy failure gate enabled."
+        deny:
+          conditions:
+            any:
+              - key: "{{ request.object.spec.params[?name=='sonarURL'].value | [0] || '' }}"
+                operator: AnyIn
+                value:
+                  - ""
+                  - " "
+              - key: "{{ length((request.object.spec.params || `[]`)[?name=='skipTrivyScan' && value!='false']) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ length((request.object.spec.params || `[]`)[?name=='trivyExitCode' && value!='1']) }}"
+                operator: GreaterThan
+                value: 0
+              - key: "{{ request.object.spec.params[?name=='trivyExtraArgs'].value[] || `[]` }}"
+                operator: AnyNotIn
+                value:
+                  - --skip-db-update
+                  - --skip-java-db-update
+                  - --db-repository=registry.example.com/security/trivy-db:2
+                  - --java-db-repository=registry.example.com/security/trivy-java-db:1
+              - key: "{{ length(request.object.spec.params[?name=='trivySeverity'].value | [0] || `[]`) }}"
+                operator: GreaterThan
+                value: 0
+```
+
+The two scalar checks inspect explicit overrides, so omission still uses the reviewed
+`"false"` and `"1"` defaults, while `"True"`, `"0"`, and `""` are not safe substitutes.
+The array checks accept the empty arrays commonly submitted by forms. `AnyNotIn` rejects
+the request if any `trivyExtraArgs` item is outside the exact allowlist, including an
+unsafe item mixed with allowed ones. It rejects `--exit-code`, `--severity`,
+`--ignore-unfixed`, and other unlisted flags, whether supplied as `--flag=value` or as
+separate items. Nonempty `trivySeverity` is also rejected because it can exclude critical
+findings. To permit a smaller severity set such as `CRITICAL` and `HIGH`, replace the
+severity check with a reviewed allowlist that requires both values and retest it.
+
+| Allowed argument | Meaning |
+| --- | --- |
+| `--skip-db-update` | Use an already populated vulnerability database cache without updating it. |
+| `--skip-java-db-update` | Use an already populated Java database cache without updating it. |
+| `--db-repository=registry.example.com/security/trivy-db:2` | Fetch the vulnerability database from the approved internal OCI repository. |
+| `--java-db-repository=registry.example.com/security/trivy-java-db:1` | Fetch the Java database from the approved internal OCI repository. |
+
+For a scanner with both databases already available in its cache, add this entry to the
+approved PipelineRun's `spec.params`:
+
+```yaml
+- name: trivyExtraArgs
+  value:
+    - --skip-db-update
+    - --skip-java-db-update
+```
+
+To download or update databases from approved internal mirrors, use this entry instead:
+
+```yaml
+- name: trivyExtraArgs
+  value:
+    - --db-repository=registry.example.com/security/trivy-db:2
+    - --java-db-repository=registry.example.com/security/trivy-java-db:1
+```
+
+The skip flags require usable cached databases; they do not download missing data. Do not
+combine a database's skip-update flag with a repository override if you expect that
+database to be downloaded. Keep cached data and internal mirrors current through your
+platform's database maintenance process. The policy checks the configured arguments,
+not database freshness. Repository values must match the allowlist exactly; arbitrary
+repositories, split `--db-repository`/value items, and unknown flags are rejected.
+
+Use a narrow `PolicyException` for a reviewed deviation, with this policy name and the
+`quality-gates-must-stay-enabled` rule. Exceptions to scenario 1 do not exempt scenario 2.
+Scanner configuration workspaces can also change scan behavior, so protect their contents
+and mount permissions. These request checks do not make arbitrary source code or tool
+configuration trustworthy.
+
+## Scenario 3: audit scan results after execution
+
+**Use case:** record whether the scanner Tasks reported their result and whether the Trivy
+summary contains critical findings. This is useful for compliance reporting and for finding
+templates that did not produce the expected result.
+
+**Enforcement point:** `TaskRun/status` after completion. The policy is `Audit`, so it does
+not block a TaskRun update. Confirm that Kyverno's reports controller can read Tekton
+`TaskRun/status` in the governed namespace.
+
+The result names are part of the Task contract and are case-sensitive:
+
+| Task | Result field | Safe interpretation |
+| --- | --- | --- |
+| `sonarqube-scanner` `0.7` | `code-scan-results.result` | The quality-gate outcome, normally `Succeeded` or another terminal result. |
+| `trivy-scanner` `0.6` | `trivy-summary-metadata.status`, `.critical`, `.high`, `.medium`, `.low`, `.unknown` | Counts are strings. Status is `passed`, `findings`, `failed`, or `unknown`; unavailable counts may be `"-"`, not zero. |
+
+The following rules match these two Task versions in the governed namespace, including
+when they are used by another Pipeline there. TaskRun resolver references remain visible
+in `spec.taskRef`; the audit does not depend on a user-supplied template label. A skipped
+Task creates no TaskRun, so these rules cannot detect a completely absent scanner. That
+is why scenario 2 protects the skip conditions.
+
+```yaml
+apiVersion: kyverno.io/v1
+kind: ClusterPolicy
+metadata:
+  name: catalog-java-scan-results-audit
+spec:
+  background: false
+  rules:
+    - name: sonarqube-result-is-succeeded
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+                - tekton.dev/v1/TaskRun/status
+              namespaces:
+                - <governed-namespace>
+      preconditions:
+        all:
+          - key: "{{ request.object.status.conditions[?type=='Succeeded'].status | [0] || '' }}"
+            operator: AnyIn
+            value:
+              - "True"
+              - "False"
+          - key: "{{ request.object.spec.taskRef.params[?name=='name'].value | [0] || '' }}"
+            operator: Equals
+            value: sonarqube-scanner
+          - key: "{{ request.object.spec.taskRef.params[?name=='version'].value | [0] || '' }}"
+            operator: Equals
+            value: "0.7"
+      validate:
+        failureAction: Audit
+        message: "sonarqube-scanner 0.7 did not report code-scan-results.result=Succeeded."
+        foreach:
+          - list: "request.object.status.results[?name=='code-scan-results'] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.value.result || '' }}"
+                    operator: NotEquals
+                    value: Succeeded
+    - name: sonarqube-result-is-present
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+                - tekton.dev/v1/TaskRun/status
+              namespaces:
+                - <governed-namespace>
+      preconditions:
+        all:
+          - key: "{{ request.object.status.conditions[?type=='Succeeded'].status | [0] || '' }}"
+            operator: AnyIn
+            value:
+              - "True"
+              - "False"
+          - key: "{{ request.object.spec.taskRef.params[?name=='name'].value | [0] || '' }}"
+            operator: Equals
+            value: sonarqube-scanner
+          - key: "{{ request.object.spec.taskRef.params[?name=='version'].value | [0] || '' }}"
+            operator: Equals
+            value: "0.7"
+      validate:
+        failureAction: Audit
+        message: "sonarqube-scanner 0.7 did not publish code-scan-results."
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(request.object.status.results[?name=='code-scan-results'] || `[]`) }}"
+                operator: Equals
+                value: 0
+    - name: trivy-result-is-present
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+                - tekton.dev/v1/TaskRun/status
+              namespaces:
+                - <governed-namespace>
+      preconditions:
+        all:
+          - key: "{{ request.object.status.conditions[?type=='Succeeded'].status | [0] || '' }}"
+            operator: AnyIn
+            value:
+              - "True"
+              - "False"
+          - key: "{{ request.object.spec.taskRef.params[?name=='name'].value | [0] || '' }}"
+            operator: Equals
+            value: trivy-scanner
+          - key: "{{ request.object.spec.taskRef.params[?name=='version'].value | [0] || '' }}"
+            operator: Equals
+            value: "0.6"
+      validate:
+        failureAction: Audit
+        message: "trivy-scanner 0.6 did not report trivy-summary-metadata."
+        deny:
+          conditions:
+            any:
+              - key: "{{ length(request.object.status.results[?name=='trivy-summary-metadata'] || `[]`) }}"
+                operator: Equals
+                value: 0
+    - name: trivy-has-no-critical-findings
+      match:
+        any:
+          - resources:
+              kinds:
+                - tekton.dev/v1/TaskRun
+                - tekton.dev/v1/TaskRun/status
+              namespaces:
+                - <governed-namespace>
+      preconditions:
+        all:
+          - key: "{{ request.object.status.conditions[?type=='Succeeded'].status | [0] || '' }}"
+            operator: AnyIn
+            value:
+              - "True"
+              - "False"
+          - key: "{{ request.object.spec.taskRef.params[?name=='name'].value | [0] || '' }}"
+            operator: Equals
+            value: trivy-scanner
+          - key: "{{ request.object.spec.taskRef.params[?name=='version'].value | [0] || '' }}"
+            operator: Equals
+            value: "0.6"
+      validate:
+        failureAction: Audit
+        message: "trivy-scanner 0.6 must report a completed scan with a numeric zero critical count."
+        foreach:
+          - list: "request.object.status.results[?name=='trivy-summary-metadata'] || `[]`"
+            deny:
+              conditions:
+                any:
+                  - key: "{{ element.value.status || '' }}"
+                    operator: AnyNotIn
+                    value:
+                      - passed
+                      - findings
+                  - key: "{{ regex_match('^[0-9]+$', element.value.critical || '') }}"
+                    operator: Equals
+                    value: false
+                  - key: "{{ to_number(element.value.critical || '0') }}"
+                    operator: GreaterThan
+                    value: 0
+```
+
+An Audit result is evidence after execution, not a substitute for the Pipeline's own
+non-zero `trivyExitCode` or SonarQube quality gate. Keep the gate in Enforce at admission
+and use the result policy to detect missing or contradictory evidence.
+The numeric guard rejects missing or nonnumeric data before conversion, so an unavailable
+count is a violation, never a clean zero. With this policy, `findings` plus `critical="0"` passes
+the critical-count audit even if other severities exist; scenario 2 can still fail the
+Pipeline for those other findings.
+
+## What this example cannot prove
+
+| Question | Why the policy is insufficient | Better control |
+| --- | --- | --- |
+| Is a resolver label trustworthy at `PipelineRun` create time? | The resolver may not have fetched the Pipeline yet, and a user can set a label. | Match resolver parameters at admission; audit labels after resolution. |
+| Does an admitted scan use current vulnerability data? | The argument allowlist does not inspect cached databases or mirror contents. | Maintain trusted internal mirrors and fresh caches; review changes to the allowlist and scanner configuration. |
+| Can a result policy stop a workload before it starts? | `TaskRun/status` exists after the Task has run. | Enforce input and exit-code policies before execution; use audit for evidence. |
+| Can a result with no numeric field support a threshold? | A report path or free-form message is not a number. | Keep it as an audit signal or add a dedicated gate that emits a numeric result. |
+| Does this Pipeline deploy only after both scans pass? | `deploy-or-upgrade` depends on Trivy; SonarQube runs on a parallel branch. Kyverno cannot change that dependency by auditing results. | Keep `workloadName` empty for build-only use, or use a separately reviewed deployment workflow that waits for both gates. |
+| Are all output images scanned? | Version `0.3` sends only `images[0]` to Trivy and deployment. | Use a single output image for this example; govern multi-image builds with a reviewed workflow. |
+| Can Maven test coverage be checked here? | The `maven` `0.6` Task does not declare a numeric coverage result. | Collect coverage through SonarQube and its server-side quality gate; a report path alone cannot support a Kyverno threshold. |
+
+## Rollout, exceptions, and self-validation
+
+Install the generic operator policy first, then this page's policies in `Audit` in a
+disposable namespace by setting `validate.failureAction: Audit` on every rule. Promote
+every rule in the reference and gate policies to `Enforce` one policy at a time; leave all
+scan-result audit rules in `Audit`.
+Follow the operator guide's exception example for an expiry-bound `PolicyException`:
+<ExternalSiteLink name="alauda-devops-pipelines"
+href="/pipelines/how_to/constrain_pipeline_execution_with_kyverno.html#roll-out-and-make-exceptions-safely"
+children="rollout and exception guidance" />.
+
+Replace the namespace before running these server-side admission checks. No build is
+started and no scanner or external image is fetched. The first request must be rejected for
+the wrong Pipeline catalog, the second for the wrong Task catalog, the third for an explicit
+scan skip, and the fourth has the approved Pipeline reference and gate values. The final
+TaskRun demonstrates that an official catalog Task is allowed. If the generic guide's
+`deny-standalone-taskrun` rule is installed, exclude this namespace or disable that rule for
+this check because that separate rule intentionally blocks every direct TaskRun.
+
+```bash
+# Use the same disposable namespace as the installed policies.
+export POLICY_NAMESPACE="<governed-namespace>"
+
+kubectl create namespace "$POLICY_NAMESPACE" --dry-run=client -o yaml | kubectl apply -f -
+
+# Wrong Pipeline catalog: allow-only-official-catalog-pipeline must reject it.
+kubectl apply --dry-run=server -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: catalog-policy-wrong-pipeline-catalog
+spec:
+  pipelineRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: untrusted-catalog
+      - name: kind
+        value: pipeline
+      - name: name
+        value: java-image-build-scan-deploy
+      - name: version
+        value: "0.3"
+YAML
+
+# Wrong Task catalog: allow-only-official-catalog-task must reject it.
+kubectl apply --dry-run=server -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: catalog-policy-wrong-task-catalog
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: untrusted-catalog
+      - name: kind
+        value: task
+      - name: name
+        value: git-clone
+      - name: version
+        value: "0.10"
+YAML
+
+# Explicit scan skip: catalog-java-quality-gates must reject it.
+kubectl apply --dry-run=server -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: java-policy-skip-scan
+spec:
+  pipelineRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: catalog-pipelines
+      - name: kind
+        value: pipeline
+      - name: name
+        value: java-image-build-scan-deploy
+      - name: version
+        value: "0.3"
+  params:
+    - name: sonarURL
+      value: https://sonarqube.example.com
+    - name: skipTrivyScan
+      value: "true"
+YAML
+
+# Approved Pipeline reference and explicit gate values: both admission policies should allow it.
+kubectl apply --dry-run=server -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: PipelineRun
+metadata:
+  name: java-policy-approved
+spec:
+  pipelineRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: catalog-pipelines
+      - name: kind
+        value: pipeline
+      - name: name
+        value: java-image-build-scan-deploy
+      - name: version
+        value: "0.3"
+  params:
+    - name: sonarURL
+      value: https://sonarqube.example.com
+    - name: skipTrivyScan
+      value: "false"
+    - name: trivyExitCode
+      value: "1"
+YAML
+
+# An official catalog Task is allowed by scenario 1.
+kubectl apply --dry-run=server -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: catalog-policy-approved-task
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: git-clone
+      - name: version
+        value: "0.10"
+YAML
+
+```
+
+Repeat the approved dry run with the following changes. Check the named denial, not just
+a nonzero exit code; a schema error or missing namespace is not evidence of a working rule.
+
+| Change to the approved request | Expected result |
+| --- | --- |
+| Wrong Pipeline `catalog`, `kind`, resolver, `url`, or `type` | Denied by `allow-only-official-catalog-pipeline`. |
+| Wrong Task `catalog`, `kind`, resolver, `url`, or `type` | Denied by `allow-only-official-catalog-task`. |
+| A different official catalog Pipeline or Task `name`/`version` | Allowed by scenario 1; catalog availability still decides whether resolution succeeds. |
+| Omit `sonarURL`, or set it to `""` or `" "` | Denied by `quality-gates-must-stay-enabled`. |
+| Set `skipTrivyScan` to `"true"`, `"True"`, or `""` | Denied by `quality-gates-must-stay-enabled`. |
+| Set `trivyExitCode` to `"0"` or `""` | Denied by `quality-gates-must-stay-enabled`. |
+| Set `trivyExtraArgs` to an array containing `--exit-code=0` | Denied by `quality-gates-must-stay-enabled`. |
+| Set `trivyExtraArgs` to `["--skip-db-update", "--skip-java-db-update"]` | Allowed at admission; both databases must already be available in the scanner cache. |
+| Use the exact approved `--db-repository=...` and `--java-db-repository=...` items | Allowed at admission; database availability and registry credentials are execution prerequisites. |
+| Mix an allowed offline argument with `--exit-code=0`, `--severity=LOW`, or `--ignore-unfixed` | Denied by `quality-gates-must-stay-enabled`. |
+| Use split items such as `["--exit-code", "0"]`, an unapproved database repository, or an unknown flag | Denied by `quality-gates-must-stay-enabled`. |
+| Set `trivySeverity` to an array containing only `LOW` | Denied by `quality-gates-must-stay-enabled`. |
+| Omit Trivy overrides, or use safe scalar defaults and empty arrays | Allowed at admission; not proof of build success. |
+
+### Produce a real Audit record
+
+First apply the reports-controller Role/RoleBinding from the companion guide if required.
+Leave `catalog-java-scan-results-audit` in `Audit`. To use the following narrow exception,
+configure the Kyverno admission controller (or the equivalent chart values) with both
+`--enablePolicyException=true` and `--exceptionNamespace=<exception-namespace>`. The
+feature flag alone is insufficient: with no allowed exception namespace, Kyverno 1.15 emits
+an admission warning but still stores the `PolicyException`; the exception controller does
+not select it, so it has no effect. The same applies when the object's namespace does not
+match the configured value. Configure the allowed namespace first and create the object
+there; substitute the namespace allowed by your installation:
+
+```yaml
+apiVersion: kyverno.io/v2
+kind: PolicyException
+metadata:
+  name: java-policy-audit-test
+  namespace: <exception-namespace>
+spec:
+  exceptions:
+    - policyName: tekton-no-inline-execution-specs
+      ruleNames:
+        - deny-standalone-taskrun
+  match:
+    any:
+      - resources:
+          kinds:
+            - tekton.dev/v1/TaskRun
+          namespaces:
+            - <governed-namespace>
+          names:
+            - java-policy-audit-missing-result
+```
+
+Create a TaskRun referencing the delivered `sonarqube-scanner` Task but deliberately omit
+its required `source` workspace. Tekton should fail validation without running a scanner:
+
+```bash
+kubectl apply -n "$POLICY_NAMESPACE" -f - <<'YAML'
+apiVersion: tekton.dev/v1
+kind: TaskRun
+metadata:
+  name: java-policy-audit-missing-result
+spec:
+  taskRef:
+    resolver: hub
+    params:
+      - name: catalog
+        value: catalog
+      - name: kind
+        value: task
+      - name: name
+        value: sonarqube-scanner
+      - name: version
+        value: "0.7"
+YAML
+kubectl wait -n "$POLICY_NAMESPACE" --for=condition=Succeeded=False \
+  taskrun/java-policy-audit-missing-result --timeout=180s
+kubectl get policyreport -n "$POLICY_NAMESPACE"
+kubectl describe policyreport -n "$POLICY_NAMESPACE"
+```
+
+If the cluster does not permit `PolicyException`, do not apply this object. For a
+disposable validation namespace, temporarily set `validate.failureAction: Audit` on only
+the generic `deny-standalone-taskrun` rule, run the check, collect the `PolicyReport`, and
+restore that rule's `validate.failureAction` to `Enforce` immediately. This temporary audit
+mode is a test technique, not a production bypass.
+
+After report reconciliation, expect `sonarqube-result-is-present: fail` for this TaskRun.
+The resource was admitted; Tekton's missing-workspace failure, not Kyverno, stopped it.
+If it fails resolution instead, the missing-result audit can still be verified, but the
+delivered Catalog contract has not been confirmed. A successful real scan should produce
+`sonarqube-result-is-succeeded: pass`. For Trivy, verify both missing results and a positive
+critical count as failures; `status=passed` with `critical="0"` should pass. Keep test
+results separate from evidence produced by real scanner execution.
+
+Delete the test exception, TaskRun, and only the policies/RBAC resources installed for this
+test. Keep any production policies in place. Dry-run denials do not create PolicyReports.
+
+## Upgrade checklist
+
+Repeat this small check when the Catalog or `artifacthub-shim` is upgraded:
+
+1. Confirm that the built-in resolver catalogs remain `catalog` for Tasks and
+   `catalog-pipelines` for Pipelines, and that the Hub resolver defaults to `artifact`.
+2. Confirm the Java Pipeline name and version used by scenario 2 in the ArtifactHub
+   Shim-delivered source. Read that Pipeline's manifest and verify the Task names and
+   versions in the anchor table; update the table only when a pin changes.
+3. Compare every policy expression with the exact parameter spelling and type. In `0.3`,
+   `skipTrivyScan`, `trivySeverity`, `trivyExitCode`, `trivyExtraArgs`, and `sonarURL` are
+   case-sensitive.
+4. Confirm result names and object properties in the referenced Task manifests. A result
+   rename or type change requires an audit-policy review.
+5. Re-run one denied admission, one allowed admission, and one status Audit test in a
+   disposable namespace before promoting the policy.
+
+If the new Pipeline contract is materially different, publish a new focused example or
+remove the old one. Do not silently make a policy claim for versions that this page has not
+checked.
+
+## Related documentation
+
+- <ExternalSiteLink name="alauda-devops-pipelines"
+  href="/pipelines/how_to/constrain_pipeline_execution_with_kyverno.html"
+  children="Constrain Tekton Pipeline Execution with Kyverno" /> — the generic Kyverno
+  mechanism and Tekton control boundaries that explain how to use and adapt this concrete
+  CI example.
+- [Specifying remote pipelines using hub resolvers](./specifying_remote_pipelines_using_hub_resolvers.mdx)
+  — resolver syntax and catalog selection.
+- [Constrain Artifact Promotion with Kyverno](./constrain_artifact_promotion_with_kyverno.mdx)
+  — separate controls for promoting artifacts between environments.
+- [Pipeline Policy Constraints with Tekton and Kyverno](https://github.com/alauda/knowledge/blob/main/docs/en/solutions/Pipeline_Policy_Constraints_with_Tekton_and_Kyverno.md)
+  — version-independent design rationale.

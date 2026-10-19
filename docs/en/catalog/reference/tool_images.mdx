@@ -34,13 +34,15 @@ steps. It offers three ways to find what you need:
 | **Build** | Go build and test | [`golang`](#golang) | Full Go toolchain with golangci-lint |
 | | Java build, test, and package | [`maven`](#maven) | Maven + JDK 21 |
 | | .NET build, test, and publish | [`dotnet`](#dotnet) | .NET SDK LTS image for application compilation |
-| | Python scripts and tests | [`python`](#python) | Python + pip |
+| | Python scripts and tests | [`python`](#python) | Python + pip, pytest, and Pygments |
+| | Python linting | [`flake8`](#flake8) | Dedicated Python runtime with Flake8 |
 | | Node.js build and test | [`nodejs`](#nodejs) | Node.js LTS runtime |
 | **Image & Artifact** | OCI image build and push | [`buildah`](#buildah) | Rootless build, no Docker daemon required |
 | | Multi-arch manifest merge (`merge-image` Task), retag, and registry inspection | [`crane`](#crane) | Uses `crane index append` to compose and publish manifest lists without a build stage |
 | | Image copy, promotion, and registry sync | [`skopeo`](#skopeo) | Copies images across registries without rebuilding |
 | | Helm chart package and publish | [`helm`](#helm) | Includes oras, kubectl, yq |
 | **Security & Compliance** | Image/filesystem vulnerability scan | [`trivy`](#trivy) | Pre-loaded vulnerability database |
+| | Java static analysis and quality gate | [`spotbugs`](#spotbugs) | SpotBugs 4.9 + JDK 21 |
 | | SBOM generation | [`syft`](#syft) | Includes cosign for optional signing |
 | | Image signing and verification | [`cosign`](#cosign) | Supports keyless and attestation |
 | | Code quality scan | [`sonarqube-scanner`](#sonarqube-scanner) | SonarQube Scanner + JDK 21 |
@@ -80,6 +82,7 @@ steps. It offers three ways to find what you need:
 | golangci-lint | [`golang`](#golang) |
 | sonar-scanner | [`sonarqube-scanner`](#sonarqube-scanner) |
 | sonar (CLI) | [`sonarqube-cli`](#sonarqube-cli) |
+| SpotBugs | [`spotbugs`](#spotbugs) |
 | msmtp | [`msmtp`](#msmtp) |
 | Node.js | [`nodejs`](#nodejs) |
 | npm | [`nodejs`](#nodejs) |
@@ -89,6 +92,9 @@ steps. It offers three ways to find what you need:
 | .NET SDK | [`dotnet`](#dotnet) |
 | Python | [`python`](#python) |
 | pip | [`python`](#python) |
+| pytest | [`python`](#python) |
+| Pygments | [`python`](#python) |
+| Flake8 | [`flake8`](#flake8) |
 
 ---
 
@@ -130,7 +136,8 @@ steps. It offers three ways to find what you need:
 | Registry | `registry-dev.alauda.io/alauda-pipelines-catalog/hub/git-init` |
 | Tag | `latest`<br/>`v1.1` |
 | Main Tools | git-init 1.1 |
-| Bundled Tools | git |
+| Bundled Tools | git, Bash, OpenSSH client, and CA certificates; non-root UID 65532 |
+| Runtime provenance | Managed `tools/git` runtime built from patched AlmaLinux 9 minimal (base digest `sha256:0f500caa116dcca004e622cd0edaecb091596533f75d9bc6b198d32c12b62861`); current `git-init` manifest digest `sha256:04886c9da7cb689556b448917c742c5626e41c765247e92cead58c742f25fae2` |
 | Best For | Repository clone, checkout, submodule handling, authenticated clone |
 | Not Recommended | Build, scan, or deploy steps that do not involve code checkout |
 
@@ -187,9 +194,20 @@ steps. It offers three ways to find what you need:
 | Registry | `registry-dev.alauda.io/alauda-pipelines-catalog/hub/python` |
 | Tag | `latest`<br/>`v3.13` |
 | Main Tools | Python 3.13 |
-| Bundled Tools | pip |
-| Best For | Python script execution, testing, utility tasks |
+| Bundled Tools | pip, pytest, Pygments, Flake8 7.3.0, security-patched msgpack and setuptools (the Flake8 Task uses the dedicated `flake8` image) |
+| Best For | Python script execution, testing, and utility tasks |
 | Not Recommended | Java/Go build workflows |
+
+#### flake8 \{#flake8\}
+
+| Field | Content |
+| --- | --- |
+| Registry | `registry-dev.alauda.io/alauda-pipelines-catalog/hub/flake8` |
+| Tag | `latest`<br/>`v7.3` |
+| Main Tools | Python 3.13, Flake8 7.3.0 |
+| Bundled Tools | Flake8 7.3.0, Python 3.13, pytest 9.0.3, Pygments 2.20.0, and security-patched msgpack/setuptools; pip is omitted from the lint-only runtime |
+| Best For | Catalog Flake8 Task and dedicated Python lint steps |
+| Not Recommended | General Python test workflows (use `python`) |
 
 #### dotnet \{#dotnet}
 
@@ -326,6 +344,17 @@ steps. It offers three ways to find what you need:
 | Bundled Tools | env-entrypoint script |
 | Best For | Auxiliary processing and bridging steps in SonarQube workflows |
 | Not Recommended | As a replacement for the main scanner or general-purpose pipeline base |
+
+#### spotbugs \{#spotbugs}
+
+| Field | Content |
+| --- | --- |
+| Registry | `registry-dev.alauda.io/alauda-pipelines-catalog/hub/spotbugs` |
+| Tag | `latest`<br/>`v4.9` |
+| Main Tools | SpotBugs 4.9.8 CLI, JDK 21 |
+| Bundled Tools | SpotBugs distribution libraries and scripts, JDK 21, managed yq, and Bash; the managed launcher preserves argument boundaries for paths with spaces and runs as non-root UID 65532 |
+| Best For | Java bytecode static analysis through the `spotbugs` Task, XML report generation, and issues-count quality gates |
+| Not Recommended | Java compilation or dependency resolution; use `maven` for build workflows |
 
 ### Deploy & Operations
 
