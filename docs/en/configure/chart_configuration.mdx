@@ -394,3 +394,66 @@ resources:
     cpu: "1"
     memory: 1Gi
 ```
+
+## Gateway API exposure
+
+Ingress remains the default. To install in a Gateway-only cluster, provide these
+values on the first Helm installation (or select **Hub Exposure Type: HTTPRoute**
+in the ACP plugin form):
+
+```yaml
+hubIngress:
+  enabled: false
+hubHTTPRoute:
+  enabled: true
+  parentRefs:
+    - name: platform
+      namespace: gateway-system
+      sectionName: https
+  hostnames:
+    - devops.example.com
+```
+
+Install the Gateway API v1 CRDs and a controller supporting HTTPRoute `URLRewrite`
+before installing the chart. The platform administrator owns the Gateway, TLS
+listener and frontend certificate. For a Gateway in another namespace, configure
+its listener `allowedRoutes` to accept the Shim namespace. A cross-namespace
+parent Gateway does not need a ReferenceGrant. The backend Service stays in the
+installation namespace and uses HTTP. No IngressClass or NGINX annotations are
+used in HTTPRoute mode, including in an ACP global cluster.
+
+`hubHTTPRoute.pathPrefix` defaults to `/hub`. PathPrefix matches `/hub` and
+`/hub/...` at path segment boundaries; ReplacePrefixMatch rewrites to `/` so that
+`/hub/api/v1/packages` reaches `/api/v1/packages`. `/hub-other` does not match.
+Leave `hostnames: []` for a hostless route, or provide DNS names without schemes
+or paths. Use `annotations` for optional Gateway controller metadata.
+
+The optional independent API endpoint uses `httpRoute.enabled`, `parentRefs`,
+`hostnames`, `annotations` and `pathPrefix` (default `/`). It preserves the request
+path. Disable `ingress.enabled` before enabling it. Each endpoint rejects an
+Ingress and HTTPRoute being enabled together; an enabled route requires at least
+one named Gateway reference. Helm rendering works offline and never downloads
+CRDs or Gateway manifests. Missing CRDs fail installation; missing Gateways or
+listener permission leave the route unaccepted and must be corrected explicitly.
+
+For the ACP plugin form, set `hubExposureType: HTTPRoute`, `hubGatewayName`,
+`hubGatewayNamespace`, `hubGatewaySectionName` and optionally `hubHostname`.
+Existing ModuleConfigs that omit these fields retain Ingress. Use Extra Chart
+Values for the independent API route or multiple parent references; avoid
+repeating keys already emitted by the form.
+
+To migrate, first save the current Helm values and release revision. Check
+Gateway listener permissions and certificates, then upgrade with the complete
+values above during a maintenance window. Helm removes the old managed Ingress.
+Confirm every expected HTTPRoute parent has current-generation `Accepted=True`
+and `ResolvedRefs=True`, and test the Hub UI, package list/detail/version APIs,
+README links and resolver requests through the real external hostname. Existing
+API authentication remains in effect. Object creation alone does not establish
+connectivity. To roll back, restore the saved release or set
+`hubHTTPRoute.enabled: false` and `hubIngress.enabled: true`, then verify the
+Ingress path. Helm removes the managed route; shared Gateways remain intact.
+
+When replacing a legacy Tekton Hub managed by the Operator,
+disable its `/hub` route before enabling the Shim route on the same listener and
+hostname. Keep one owner of `/hub`, migrate catalog/resolver configuration, and
+verify PAC catalog resolution before removing the old backend.
