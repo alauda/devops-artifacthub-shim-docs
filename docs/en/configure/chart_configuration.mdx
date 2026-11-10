@@ -395,6 +395,43 @@ resources:
     memory: 1Gi
 ```
 
+## Approval email URL configuration
+
+Approval email templates use the URL settings from the enhancement controller's
+`tektoncd-enhancement-config` ConfigMap. Set `approval-notification.platform-url`
+and `approval-notification.details-url-template` there to apply the same approval
+link to custom templates and the built-in default email. An empty details template
+inherits `template-render.details-url-template` from that ConfigMap, then the
+standard PipelineRun route. An empty platform URL uses
+`kube-public/global-info.data.platformURL`.
+
+If Tekton is installed in another namespace, set the enhancement ConfigMap reference
+in the shim Helm values:
+
+```yaml
+extension:
+  approvalNotification:
+    configMapRef:
+      namespace: tekton-pipelines
+      name: tektoncd-enhancement-config
+      key: config
+```
+
+These fields are administrator settings. The webhook reads the current ConfigMap
+for each approval render, without calling enhancement or reading its SMTP Secret.
+If the ConfigMap is absent, standalone shim deployments retain their own
+`extension.templateRender.detailsURLTemplate` and platform discovery. Other read
+or YAML errors annotate the CustomRun and preserve caller mail fields; enhancement falls back
+to the built-in default email only when the current fields are missing, partial, or invalid.
+Ordinary Send Mail TaskRuns keep their existing configuration.
+
+For approval CREATE and dry-run rendering, the caller needs `get` on the selected
+template ConfigMap and the parent PipelineRun, plus `get` and namespace-scoped
+`list` on child TaskRuns and CustomRuns used by the context. Local Pipeline/Task
+definitions need `get` only when no resolved run snapshot exists. A denied read
+discards custom rendering. Remote definitions without snapshots also fall back;
+approval rendering does not submit resolution requests.
+
 ## Gateway API exposure
 
 Ingress remains the default. To install in a Gateway-only cluster, provide these
