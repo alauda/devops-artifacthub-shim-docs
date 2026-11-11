@@ -383,14 +383,14 @@ P2 / Phase B：
 
 ### 3. tektoncd-pipeline resolver 改造范围
 
-resolver 默认配置应从 `tektoncd-pipeline` 的 `config/pipeline/resolver-patch.yaml` 改起，再由 operator 同步。目标基础配置为：
+resolver 默认配置应从 `tektoncd-pipeline` 的 `config/pipeline/resolver-patch.yaml` 改起，再由 operator 同步。operator 将 `hubresolver-config` 写入 `TektonConfig/config.spec.targetNamespace`；enhancement API 也以该字段作为执行集群的首选读取位置，并只在首选 ConfigMap NotFound 时兼容读取 `${SYSTEM_NAMESPACE}-resolvers`。目标基础配置为：
 
 ```yaml
 apiVersion: v1
 kind: ConfigMap
 metadata:
   name: hubresolver-config
-  namespace: tekton-pipelines-resolvers
+  # namespace is the TektonConfig/config.spec.targetNamespace value
 data:
   artifact-hub-api: http://artifacthub-shim-api.artifacthub-shim-system.svc.cluster.local/
   default-artifact-hub-task-catalog: catalog

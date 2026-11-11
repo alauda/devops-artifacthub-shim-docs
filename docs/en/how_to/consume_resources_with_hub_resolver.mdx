@@ -24,6 +24,29 @@ or one of the built-in catalog names:
 The built-in StepAction catalog is registered only when the packaged catalog
 contains a `stepaction/` directory.
 
+For run-detail or other metadata consumers, a Hub reference may omit resolver
+defaults that were supplied by Tekton at execution time. Read the capabilities
+endpoint from the execution cluster before constructing a display lookup. The
+precedence for each omitted parameter is:
+
+1. An explicit value in the saved reference, including an explicit empty string.
+2. The matching capabilities field (`defaultType` or `defaultKind`).
+3. Unavailable, in which case the original metadata is kept.
+
+After `type` and `kind` are resolved, the consumer selects the Artifact Hub
+Task or Pipeline catalog from the matching default field. An Artifact Hub
+StepAction has no default catalog and must include `catalog` explicitly; Tekton
+Hub references use `defaultTektonHubCatalog` for any resource kind. Do not
+infer `kind` from `taskRef`, `pipelineRef`, or another surrounding field, and
+do not rewrite the saved PipelineRun or TaskRun spec. Collection list endpoints
+can be called without a catalog; package detail, version detail, raw manifest,
+and batch item lookups require an explicit catalog.
+
+If the capabilities request returns `401`, `403`, `404`, `5xx`, times out, or
+the gateway is unreachable, treat the defaults as unavailable. Keep the
+original run metadata and avoid issuing a lookup with an `undefined` or guessed
+catalog. This preserves compatibility with older enhancement API versions.
+
 ## Prerequisites
 
 - `artifacthub-shim` is installed and ready.
@@ -114,8 +137,8 @@ spec:
               value: "0.1.0"
 ```
 
-StepAction references should pass `catalog` explicitly. Current hub resolver
-defaults only include Artifact Hub task and pipeline catalog settings.
+Artifact Hub StepAction references should pass `catalog` explicitly. Tekton Hub
+references use the resolver's `default-tekton-hub-catalog` value.
 
 ## Historical Pipeline Catalog Compatibility
 

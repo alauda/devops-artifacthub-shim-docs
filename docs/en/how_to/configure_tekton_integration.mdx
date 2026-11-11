@@ -55,6 +55,45 @@ If `artifacthub-shim` is installed into another namespace, replace
 If the Helm release name changes and the Service name is overridden, update the
 Service host as well.
 
+### Resolver defaults for run details
+
+The enhancement capabilities endpoint exposes the resolver defaults that a DevOps
+UI run-detail consumer may need when historical metadata omits a Hub parameter:
+
+```http
+GET /apis/v1alpha1/capabilities
+```
+
+Use the route for the cluster that will execute the run. The same endpoint is
+available through the global-cluster gateway at
+`/tektoncd-enhancement/apis/v1alpha1/capabilities` and through the
+cluster-rewrite route at
+`/clusters-rewrite/<cluster>/tektoncd-enhancement/apis/v1alpha1/capabilities`.
+All routes require a Bearer token. The enhancement service reads
+`TektonConfig/config.spec.targetNamespace` on every request and loads
+`hubresolver-config` from that target namespace. If target-namespace discovery
+is unavailable, it uses the enhancement Pod's `SYSTEM_NAMESPACE`; a missing
+ConfigMap then permits the legacy `${SYSTEM_NAMESPACE}-resolvers` lookup.
+
+The response may contain `hubResolverDefaults.defaultType`,
+`defaultKind`, `defaultArtifactHubTaskCatalog`,
+`defaultArtifactHubPipelineCatalog`, and `defaultTektonHubCatalog`. A consumer
+fills only omitted `resolver=hub` parameters in a copy of the query: explicit
+values, including an explicit empty string, remain unchanged; `defaultType`
+and `defaultKind` are used before selecting a catalog. Task and Pipeline
+Artifact Hub lookups use their corresponding catalog fields. An Artifact Hub
+StepAction has no default catalog and must supply one explicitly; Tekton Hub
+references use `defaultTektonHubCatalog` for any resource kind. The saved
+PipelineRun or TaskRun spec remains the execution source of truth.
+
+The endpoint is optional for compatibility with older enhancement backends. On
+`401`, `403`, `404`, `5xx`, timeout, or gateway/network failure, keep the
+original run metadata and do not send a package, version, raw-manifest, or
+batch-item request with an undefined or guessed catalog. Collection list
+requests do not require a catalog. The service reads the ConfigMap on each
+capabilities request, so changes become visible after the next request without
+a restart.
+
 ## Pipelines as Code
 
 PAC remote annotations use PAC settings, not `TektonConfig` resolver settings.
